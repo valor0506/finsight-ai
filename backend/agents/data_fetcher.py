@@ -3,6 +3,7 @@ import httpx
 from datetime import datetime
 from typing import Optional
 from core.config import get_settings
+import asyncio
 
 settings = get_settings()
 
@@ -16,15 +17,15 @@ COMMODITY_TICKERS = {
     "ALUMINIUM":    "ALI=F",
 }
 
+# Fix symbol
 MACRO_TICKERS = {
     "US_10Y_YIELD": "^TNX",
-    "DXY":          "DX-Y.NYB",
+    "DXY":          "DX=F",       # was DX-Y.NYB
     "NIFTY50":      "^NSEI",
     "USDINR":       "INR=X",
     "VIX_US":       "^VIX",
     "VIX_INDIA":    "^NSEVIN",
 }
-
 
 async def get_commodity_data(symbol: str) -> dict:
     ticker_str = COMMODITY_TICKERS.get(symbol.upper())
@@ -153,7 +154,8 @@ async def get_macro_snapshot() -> dict:
             }
         except Exception as e:
             results[name] = {"error": str(e)}
-
+        
+        await asyncio.sleep(2)  # <-- this is the key fix to avoid hitting Yahoo Finance rate limits
     # Gold-Silver Ratio
     try:
         gold   = await get_commodity_data("GOLD")
@@ -223,3 +225,17 @@ def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
     if avg_loss == 0:
         return 100.0
     return 100 - (100 / (1 + avg_gain / avg_loss))
+
+import time
+
+def fetch_with_retry(ticker_symbol, retries=3, delay=3):
+    for i in range(retries):
+        try:
+            ticker = yf.Ticker(ticker_symbol)
+            data = ticker.history(period="5d")
+            if not data.empty:
+                return data
+        except Exception as e:
+            print(f"Attempt {i+1} failed for {ticker_symbol}: {e}")
+        time.sleep(delay)
+    return None
