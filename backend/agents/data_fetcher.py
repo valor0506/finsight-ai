@@ -213,6 +213,35 @@ async def get_fred_data() -> dict:
     results["fetched_at"] = datetime.utcnow().isoformat()
     return results
 
+async def get_news(query: str, page_size: int = 10) -> list:
+    if not settings.news_api_key:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://newsapi.org/v2/everything",
+                params={
+                    "q": query,
+                    "apiKey": settings.news_api_key,
+                    "pageSize": page_size,
+                    "sortBy": "publishedAt",
+                    "language": "en",
+                }
+            )
+            articles = resp.json().get("articles", [])
+            return [
+                {
+                    "title": a.get("title"),
+                    "source": a.get("source", {}).get("name"),
+                    "published_at": a.get("publishedAt"),
+                    "url": a.get("url"),
+                    "description": a.get("description"),
+                }
+                for a in articles
+            ]
+    except Exception as e:
+        return []
+
 
 def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
     if len(closes) < period + 1:
@@ -228,14 +257,14 @@ def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
 
 import time
 
-def fetch_with_retry(ticker_symbol, retries=3, delay=3):
-    for i in range(retries):
-        try:
-            ticker = yf.Ticker(ticker_symbol)
-            data = ticker.history(period="5d")
-            if not data.empty:
-                return data
-        except Exception as e:
-            print(f"Attempt {i+1} failed for {ticker_symbol}: {e}")
-        time.sleep(delay)
-    return None
+# def fetch_with_retry(ticker_symbol, retries=3, delay=3):
+#     for i in range(retries):
+#         try:
+#             ticker = yf.Ticker(ticker_symbol)
+#             data = ticker.history(period="5d")
+#             if not data.empty:
+#                 return data
+#         except Exception as e:
+#             print(f"Attempt {i+1} failed for {ticker_symbol}: {e}")
+#         time.sleep(delay)
+#     return None
