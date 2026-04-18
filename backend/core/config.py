@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # AI
     gemini_api_key: str
-
+    news_api_key: str = ""
     # Database
     database_url: str
     supabase_url: str
