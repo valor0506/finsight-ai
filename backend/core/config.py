@@ -13,7 +13,13 @@ class Settings(BaseSettings):
 
     # AI
     gemini_api_key: str
+
+    # External APIs
     news_api_key: str = ""
+    fred_api_key: str = ""
+    alpha_vantage_key: str = ""
+    twelvedata_api_key: str = ""
+
     # Database
     database_url: str
     supabase_url: str
@@ -22,10 +28,6 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str
-
-    # External APIs
-    fred_api_key: str = ""
-    alpha_vantage_key: str = ""
 
     class Config:
         env_file = ".env"

@@ -1,4 +1,3 @@
-import yfinance as yf
 import httpx
 from datetime import datetime
 from typing import Optional
@@ -7,162 +6,271 @@ import asyncio
 
 settings = get_settings()
 
-COMMODITY_TICKERS = {
-    "SILVER":       "SI=F",
-    "GOLD":         "GC=F",
-    "CRUDE_BRENT":  "BZ=F",
-    "CRUDE_WTI":    "CL=F",
-    "NATURAL_GAS":  "NG=F",
-    "COPPER":       "HG=F",
-    "ALUMINIUM":    "ALI=F",
+# ── Twelve Data symbol maps ────────────────────────────────────
+# Twelve Data uses these exact symbols for commodities/forex/indices
+COMMODITY_TD = {
+    "SILVER":      "XAG/USD",
+    "GOLD":        "XAU/USD",
+    "CRUDE_BRENT": "BCO/USD",
+    "CRUDE_WTI":   "WTI/USD",
+    "NATURAL_GAS": "NATURALGAS/USD",
+    "COPPER":      "COPPER/USD",
 }
 
-# Fix symbol
-MACRO_TICKERS = {
-    "US_10Y_YIELD": "^TNX",
-    "DXY":          "DX=F",       # was DX-Y.NYB
-    "NIFTY50":      "^NSEI",
-    "USDINR":       "INR=X",
-    "VIX_US":       "^VIX",
-    "VIX_INDIA":    "^NSEVIN",
+MACRO_TD = {
+    "DXY":          "DXY",
+    "US_10Y_YIELD": "TNX",
+    "NIFTY50":      "NSEI",
+    "USDINR":       "USD/INR",
+    "VIX_US":       "VIX",
 }
+
+TD_BASE = "https://api.twelvedata.com"
+
+
+# ── Core Twelve Data helpers ───────────────────────────────────
+
+async def _td_price(symbol: str) -> Optional[float]:
+    """Get latest price for any Twelve Data symbol."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{TD_BASE}/price", params={
+                "symbol":  symbol,
+                "apikey":  settings.twelvedata_api_key,
+            })
+            data = r.json()
+            if data.get("status") == "error":
+                return None
+            return float(data.get("price", 0)) or None
+    except Exception:
+        return None
+
+
+async def _td_time_series(symbol: str, outputsize: int = 90) -> list:
+    """Get OHLCV daily time series. Returns list of dicts oldest→newest."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{TD_BASE}/time_series", params={
+                "symbol":     symbol,
+                "interval":   "1day",
+                "outputsize": outputsize,
+                "apikey":     settings.twelvedata_api_key,
+            })
+            data = r.json()
+            if data.get("status") == "error":
+                return []
+            values = data.get("values", [])
+            # TD returns newest first — reverse to oldest first
+            return list(reversed(values))
+    except Exception:
+        return []
+
+
+async def _td_indicator(symbol: str, indicator: str, **params) -> Optional[float]:
+    """
+    Get latest value of a technical indicator from Twelve Data.
+    indicator: "rsi", "sma", "ema" etc.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{TD_BASE}/{indicator}", params={
+                "symbol":   symbol,
+                "interval": "1day",
+                "apikey":   settings.twelvedata_api_key,
+                **params,
+            })
+            data = r.json()
+            if data.get("status") == "error":
+                return None
+            values = data.get("values", [])
+            if not values:
+                return None
+            # first value in response = most recent
+            key = list(values[0].keys())[-1]  # rsi/sma/ema key
+            return round(float(values[0][key]), 2)
+    except Exception:
+        return None
+
+
+async def _td_52w(symbol: str) -> tuple[Optional[float], Optional[float]]:
+    """Returns (52w_high, 52w_low) from 1-year daily data."""
+    series = await _td_time_series(symbol, outputsize=252)
+    if not series:
+        return None, None
+    highs = [float(c["high"]) for c in series if c.get("high")]
+    lows  = [float(c["low"])  for c in series if c.get("low")]
+    return (round(max(highs), 4), round(min(lows), 4)) if highs else (None, None)
+
+
+# ── Public functions ───────────────────────────────────────────
 
 async def get_commodity_data(symbol: str) -> dict:
-    ticker_str = COMMODITY_TICKERS.get(symbol.upper())
-    if not ticker_str:
+    td_sym = COMMODITY_TD.get(symbol.upper())
+    if not td_sym:
         return {"error": f"Unknown symbol: {symbol}"}
 
     try:
-        ticker = yf.Ticker(ticker_str)
-        info = ticker.info
-        hist = ticker.history(period="3mo", interval="1d")
+        # Fetch price + time series + indicators concurrently
+        # TD free = 8 calls/min — we batch carefully
+        price_task   = _td_price(td_sym)
+        series_task  = _td_time_series(td_sym, outputsize=60)
+        rsi_task     = _td_indicator(td_sym, "rsi",  time_period=14)
+        sma20_task   = _td_indicator(td_sym, "sma",  time_period=20)
+        sma50_task   = _td_indicator(td_sym, "sma",  time_period=50)
 
-        current_price = info.get("regularMarketPrice") or info.get("previousClose", 0)
-        week_52_high = info.get("fiftyTwoWeekHigh", 0)
-        week_52_low = info.get("fiftyTwoWeekLow", 0)
+        price, series, rsi, sma20, sma50 = await asyncio.gather(
+            price_task, series_task, rsi_task, sma20_task, sma50_task
+        )
+
+        # 52w high/low from series
+        hi52w, lo52w = None, None
+        if series:
+            highs = [float(c["high"]) for c in series if c.get("high")]
+            lows  = [float(c["low"])  for c in series if c.get("low")]
+            hi52w = round(max(highs), 4) if highs else None
+            lo52w = round(min(lows),  4) if lows  else None
+
         pct_from_high = (
-            (current_price - week_52_high) / week_52_high * 100
-        ) if week_52_high else 0
+            round((price - hi52w) / hi52w * 100, 2)
+            if price and hi52w else None
+        )
 
         price_history = []
-        if not hist.empty:
-            for date, row in hist.tail(60).iterrows():
+        for candle in series:
+            try:
                 price_history.append({
-                    "date": date.strftime("%Y-%m-%d"),
-                    "open": round(row["Open"], 2),
-                    "high": round(row["High"], 2),
-                    "low":  round(row["Low"], 2),
-                    "close": round(row["Close"], 2),
-                    "volume": int(row["Volume"]),
+                    "date":   candle["datetime"],
+                    "open":   round(float(candle["open"]),   4),
+                    "high":   round(float(candle["high"]),   4),
+                    "low":    round(float(candle["low"]),    4),
+                    "close":  round(float(candle["close"]),  4),
+                    "volume": int(float(candle.get("volume", 0))),
                 })
-
-        closes = [d["close"] for d in price_history]
-        sma_20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
-        sma_50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
-        rsi    = _calculate_rsi(closes) if len(closes) >= 15 else None
+            except Exception:
+                continue
 
         return {
-            "symbol": symbol,
-            "ticker": ticker_str,
-            "current_price": current_price,
-            "currency": info.get("currency", "USD"),
-            "week_52_high": week_52_high,
-            "week_52_low": week_52_low,
-            "pct_from_52w_high": round(pct_from_high, 2),
-            "volume": info.get("regularMarketVolume"),
-            "sma_20": round(sma_20, 2) if sma_20 else None,
-            "sma_50": round(sma_50, 2) if sma_50 else None,
-            "rsi_14": round(rsi, 2) if rsi else None,
-            "price_history": price_history,
-            "fetched_at": datetime.utcnow().isoformat(),
+            "symbol":           symbol,
+            "ticker":           td_sym,
+            "current_price":    price,
+            "currency":         "USD",
+            "week_52_high":     hi52w,
+            "week_52_low":      lo52w,
+            "pct_from_52w_high": pct_from_high,
+            "sma_20":           sma20,
+            "sma_50":           sma50,
+            "rsi_14":           rsi,
+            "price_history":    price_history,
+            "fetched_at":       datetime.utcnow().isoformat(),
         }
+
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
 
 
 async def get_equity_data(ticker: str) -> dict:
+    """
+    Equity data via Twelve Data.
+    For Indian stocks use BSE/NSE suffix e.g. "RELIANCE:NSE"
+    For US stocks just the ticker e.g. "AAPL"
+    Fundamentals (PE, PB etc.) not available on TD free tier —
+    those fields will be None. Price + technicals work fine.
+    """
     try:
-        stock = yf.Ticker(ticker)
-        info  = stock.info
-        hist  = stock.history(period="1y", interval="1d")
+        price_task  = _td_price(ticker)
+        series_task = _td_time_series(ticker, outputsize=60)
+        rsi_task    = _td_indicator(ticker, "rsi",  time_period=14)
+        sma50_task  = _td_indicator(ticker, "sma",  time_period=50)
+        sma200_task = _td_indicator(ticker, "sma",  time_period=200)
 
-        closes = hist["Close"].tolist() if not hist.empty else []
+        price, series, rsi, sma50, sma200 = await asyncio.gather(
+            price_task, series_task, rsi_task, sma50_task, sma200_task
+        )
+
+        hi52w, lo52w = None, None
+        if series:
+            highs = [float(c["high"]) for c in series if c.get("high")]
+            lows  = [float(c["low"])  for c in series if c.get("low")]
+            hi52w = round(max(highs), 2) if highs else None
+            lo52w = round(min(lows),  2) if lows  else None
+
         price_history = []
-        if not hist.empty:
-            for date, row in hist.tail(60).iterrows():
+        for candle in series:
+            try:
                 price_history.append({
-                    "date": date.strftime("%Y-%m-%d"),
-                    "close": round(row["Close"], 2),
-                    "volume": int(row["Volume"]),
+                    "date":   candle["datetime"],
+                    "close":  round(float(candle["close"]), 2),
+                    "volume": int(float(candle.get("volume", 0))),
                 })
-
-        sma_50  = sum(closes[-50:])  / 50  if len(closes) >= 50  else None
-        sma_200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
-        rsi     = _calculate_rsi(closes) if len(closes) >= 15 else None
+            except Exception:
+                continue
 
         return {
-            "ticker": ticker,
-            "company_name": info.get("longName", ticker),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-            "market_cap": info.get("marketCap"),
-            "current_price": info.get("currentPrice") or info.get("previousClose"),
-            "currency": info.get("currency", "INR"),
-            "pe_ratio": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "pb_ratio": info.get("priceToBook"),
-            "ev_ebitda": info.get("enterpriseToEbitda"),
-            "revenue": info.get("totalRevenue"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "gross_margin": info.get("grossMargins"),
-            "operating_margin": info.get("operatingMargins"),
-            "profit_margin": info.get("profitMargins"),
-            "roe": info.get("returnOnEquity"),
-            "roa": info.get("returnOnAssets"),
-            "debt_to_equity": info.get("debtToEquity"),
-            "current_ratio": info.get("currentRatio"),
-            "free_cashflow": info.get("freeCashflow"),
-            "dividend_yield": info.get("dividendYield"),
-            "week_52_high": info.get("fiftyTwoWeekHigh"),
-            "week_52_low": info.get("fiftyTwoWeekLow"),
-            "beta": info.get("beta"),
-            "analyst_target_price": info.get("targetMeanPrice"),
-            "analyst_recommendation": info.get("recommendationKey"),
-            "analyst_count": info.get("numberOfAnalystOpinions"),
-            "sma_50": round(sma_50, 2) if sma_50 else None,
-            "sma_200": round(sma_200, 2) if sma_200 else None,
-            "rsi_14": round(rsi, 2) if rsi else None,
+            "ticker":        ticker,
+            "company_name":  ticker,       # TD free doesn't give company name
+            "current_price": price,
+            "currency":      "INR",
+            "week_52_high":  hi52w,
+            "week_52_low":   lo52w,
+            "sma_50":        sma50,
+            "sma_200":       sma200,
+            "rsi_14":        rsi,
             "price_history": price_history,
-            "fetched_at": datetime.utcnow().isoformat(),
+            # Fundamentals below — None on free tier
+            # Upgrade TD plan or add separate BSE/NSE scraper later
+            "sector":                None,
+            "industry":              None,
+            "market_cap":            None,
+            "pe_ratio":              None,
+            "forward_pe":            None,
+            "pb_ratio":              None,
+            "ev_ebitda":             None,
+            "revenue":               None,
+            "revenue_growth":        None,
+            "gross_margin":          None,
+            "operating_margin":      None,
+            "profit_margin":         None,
+            "roe":                   None,
+            "roa":                   None,
+            "debt_to_equity":        None,
+            "current_ratio":         None,
+            "free_cashflow":         None,
+            "dividend_yield":        None,
+            "beta":                  None,
+            "analyst_target_price":  None,
+            "analyst_recommendation":None,
+            "analyst_count":         None,
+            "fetched_at":            datetime.utcnow().isoformat(),
         }
+
     except Exception as e:
         return {"error": str(e), "ticker": ticker}
 
 
 async def get_macro_snapshot() -> dict:
+    """
+    Macro indicators via Twelve Data.
+    All fetched concurrently — no sleep needed (TD is reliable).
+    """
     results = {}
-    for name, ticker_str in MACRO_TICKERS.items():
-        try:
-            ticker = yf.Ticker(ticker_str)
-            hist   = ticker.history(period="5d", interval="1d")
-            latest = hist["Close"].iloc[-1] if not hist.empty else None
-            prev   = hist["Close"].iloc[-2] if len(hist) >= 2 else None
-            change = ((latest - prev) / prev * 100) if (latest and prev) else None
-            results[name] = {
-                "value": round(latest, 4) if latest else None,
-                "change_pct_1d": round(change, 2) if change else None,
-            }
-        except Exception as e:
-            results[name] = {"error": str(e)}
-        
-        await asyncio.sleep(2)  # <-- this is the key fix to avoid hitting Yahoo Finance rate limits
-    # Gold-Silver Ratio
+
+    async def _fetch_one(name: str, sym: str):
+        price = await _td_price(sym)
+        results[name] = {
+            "value":          price,
+            "change_pct_1d":  None,   # would need 2 calls — skip for now
+        }
+
+    tasks = [_fetch_one(name, sym) for name, sym in MACRO_TD.items()]
+    await asyncio.gather(*tasks)
+
+    # Gold-Silver ratio
     try:
-        gold   = await get_commodity_data("GOLD")
-        silver = await get_commodity_data("SILVER")
-        if gold.get("current_price") and silver.get("current_price"):
+        gold_p   = await _td_price("XAU/USD")
+        silver_p = await _td_price("XAG/USD")
+        if gold_p and silver_p:
             results["GOLD_SILVER_RATIO"] = {
-                "value": round(gold["current_price"] / silver["current_price"], 2)
+                "value": round(gold_p / silver_p, 2)
             }
     except Exception:
         pass
@@ -172,46 +280,48 @@ async def get_macro_snapshot() -> dict:
 
 
 async def get_fred_data() -> dict:
+    """US macro data from FRED API — reliable, official, always works."""
     if not settings.fred_api_key:
         return {"error": "FRED API key not configured"}
 
     fred_series = {
-        "fed_funds_rate":    "FEDFUNDS",
-        "cpi_yoy":           "CPIAUCSL",
-        "core_pce":          "PCEPILFE",
-        "unemployment":      "UNRATE",
-        "us_10y_yield":      "GS10",
-        "us_real_gdp_growth":"A191RL1Q225SBEA",
+        "fed_funds_rate":     "FEDFUNDS",
+        "cpi_yoy":            "CPIAUCSL",
+        "core_pce":           "PCEPILFE",
+        "unemployment":       "UNRATE",
+        "us_10y_yield":       "GS10",
+        "us_real_gdp_growth": "A191RL1Q225SBEA",
     }
 
     base_url = "https://api.stlouisfed.org/fred/series/observations"
-    results = {}
+    results  = {}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         for name, series_id in fred_series.items():
             try:
                 resp = await client.get(base_url, params={
-                    "series_id": series_id,
-                    "api_key":   settings.fred_api_key,
-                    "file_type": "json",
-                    "sort_order":"desc",
-                    "limit":     2,
+                    "series_id":  series_id,
+                    "api_key":    settings.fred_api_key,
+                    "file_type":  "json",
+                    "sort_order": "desc",
+                    "limit":      2,
                 })
                 obs = resp.json().get("observations", [])
                 if obs:
                     val  = float(obs[0]["value"]) if obs[0]["value"] != "." else None
                     prev = float(obs[1]["value"]) if len(obs) > 1 and obs[1]["value"] != "." else None
                     results[name] = {
-                        "value": val,
-                        "date": obs[0]["date"],
+                        "value":      val,
+                        "date":       obs[0]["date"],
                         "prev_value": prev,
-                        "change": round(val - prev, 3) if (val and prev) else None,
+                        "change":     round(val - prev, 3) if (val and prev) else None,
                     }
             except Exception as e:
                 results[name] = {"error": str(e)}
 
     results["fetched_at"] = datetime.utcnow().isoformat()
     return results
+
 
 async def get_news(query: str, page_size: int = 10) -> list:
     if not settings.news_api_key:
@@ -221,50 +331,23 @@ async def get_news(query: str, page_size: int = 10) -> list:
             resp = await client.get(
                 "https://newsapi.org/v2/everything",
                 params={
-                    "q": query,
-                    "apiKey": settings.news_api_key,
+                    "q":        query,
+                    "apiKey":   settings.news_api_key,
                     "pageSize": page_size,
-                    "sortBy": "publishedAt",
+                    "sortBy":   "publishedAt",
                     "language": "en",
                 }
             )
             articles = resp.json().get("articles", [])
             return [
                 {
-                    "title": a.get("title"),
-                    "source": a.get("source", {}).get("name"),
+                    "title":        a.get("title"),
+                    "source":       a.get("source", {}).get("name"),
                     "published_at": a.get("publishedAt"),
-                    "url": a.get("url"),
-                    "description": a.get("description"),
+                    "url":          a.get("url"),
+                    "description":  a.get("description"),
                 }
                 for a in articles
             ]
-    except Exception as e:
+    except Exception:
         return []
-
-
-def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains  = [d if d > 0 else 0 for d in deltas]
-    losses = [abs(d) if d < 0 else 0 for d in deltas]
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    return 100 - (100 / (1 + avg_gain / avg_loss))
-
-import time
-
-# def fetch_with_retry(ticker_symbol, retries=3, delay=3):
-#     for i in range(retries):
-#         try:
-#             ticker = yf.Ticker(ticker_symbol)
-#             data = ticker.history(period="5d")
-#             if not data.empty:
-#                 return data
-#         except Exception as e:
-#             print(f"Attempt {i+1} failed for {ticker_symbol}: {e}")
-#         time.sleep(delay)
-#     return None
