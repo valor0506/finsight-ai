@@ -6,162 +6,192 @@ import asyncio
 
 settings = get_settings()
 
-# ── Twelve Data symbol maps ────────────────────────────────────
-# Twelve Data uses these exact symbols for commodities/forex/indices
-COMMODITY_TD = {
-    "SILVER":      "XAG/USD",
-    "GOLD":        "XAU/USD",
-    "CRUDE_BRENT": "BCO/USD",
-    "CRUDE_WTI":   "WTI/USD",
-    "NATURAL_GAS": "NATURALGAS/USD",
-    "COPPER":      "COPPER/USD",
+AV_BASE = "https://www.alphavantage.co/query"
+
+# Alpha Vantage commodity function map
+COMMODITY_AV = {
+    "SILVER":      "SILVER",
+    "GOLD":        "GOLD",
+    "CRUDE_BRENT": "BRENT",
+    "CRUDE_WTI":   "WTI",
+    "NATURAL_GAS": "NATURAL_GAS",
+    "COPPER":      "COPPER",
+    "ALUMINIUM":   "ALUMINUM",
 }
 
-MACRO_TD = {
-    "DXY":          "DXY",
-    "US_10Y_YIELD": "TNX",
-    "NIFTY50":      "NSEI",
-    "USDINR":       "USD/INR",
-    "VIX_US":       "VIX",
+# Alpha Vantage forex pairs for macro
+MACRO_FOREX = {
+    "USDINR": ("USD", "INR"),
 }
 
-TD_BASE = "https://api.twelvedata.com"
+# These come from FRED — more reliable than AV for macro
+FRED_MACRO = {
+    "US_10Y_YIELD": "GS10",
+    "DXY":          "DTWEXBGS",
+    "VIX_US":       "VIXCLS",
+}
 
 
-# ── Core Twelve Data helpers ───────────────────────────────────
-
-async def _td_price(symbol: str) -> Optional[float]:
-    """Get latest price for any Twelve Data symbol."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{TD_BASE}/price", params={
-                "symbol":  symbol,
-                "apikey":  settings.twelvedata_api_key,
-            })
-            data = r.json()
-            if data.get("status") == "error":
-                return None
-            return float(data.get("price", 0)) or None
-    except Exception:
+def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
         return None
+    deltas   = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains    = [d if d > 0 else 0 for d in deltas]
+    losses   = [abs(d) if d < 0 else 0 for d in deltas]
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
 
 
-async def _td_time_series(symbol: str, outputsize: int = 90) -> list:
-    """Get OHLCV daily time series. Returns list of dicts oldest→newest."""
+async def _av_commodity(function: str) -> list:
+    """
+    Fetch monthly commodity data from Alpha Vantage.
+    Returns list of {date, value} dicts sorted oldest to newest.
+    """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(f"{TD_BASE}/time_series", params={
-                "symbol":     symbol,
-                "interval":   "1day",
-                "outputsize": outputsize,
-                "apikey":     settings.twelvedata_api_key,
+            r = await client.get(AV_BASE, params={
+                "function": function,
+                "interval": "monthly",
+                "apikey":   settings.alpha_vantage_key,
             })
             data = r.json()
-            if data.get("status") == "error":
-                return []
-            values = data.get("values", [])
-            # TD returns newest first — reverse to oldest first
-            return list(reversed(values))
+            rows = data.get("data", [])
+            # AV returns newest first — reverse
+            return list(reversed(rows))
     except Exception:
         return []
 
 
-async def _td_indicator(symbol: str, indicator: str, **params) -> Optional[float]:
-    """
-    Get latest value of a technical indicator from Twelve Data.
-    indicator: "rsi", "sma", "ema" etc.
-    """
+async def _av_quote(symbol: str) -> dict:
+    """Get current quote for a stock/ETF symbol."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{TD_BASE}/{indicator}", params={
+            r = await client.get(AV_BASE, params={
+                "function": "GLOBAL_QUOTE",
                 "symbol":   symbol,
-                "interval": "1day",
-                "apikey":   settings.twelvedata_api_key,
-                **params,
+                "apikey":   settings.alpha_vantage_key,
             })
-            data = r.json()
-            if data.get("status") == "error":
-                return None
-            values = data.get("values", [])
-            if not values:
-                return None
-            # first value in response = most recent
-            key = list(values[0].keys())[-1]  # rsi/sma/ema key
-            return round(float(values[0][key]), 2)
+            return r.json().get("Global Quote", {})
     except Exception:
+        return {}
+
+
+async def _av_daily(symbol: str, outputsize: str = "compact") -> dict:
+    """
+    Get daily OHLCV for a stock symbol.
+    outputsize: "compact" = last 100 days, "full" = 20 years
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(AV_BASE, params={
+                "function":   "TIME_SERIES_DAILY",
+                "symbol":     symbol,
+                "outputsize": outputsize,
+                "apikey":     settings.alpha_vantage_key,
+            })
+            return r.json().get("Time Series (Daily)", {})
+    except Exception:
+        return {}
+
+
+async def _av_forex_daily(from_sym: str, to_sym: str) -> dict:
+    """Get daily forex rate history."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(AV_BASE, params={
+                "function":    "FX_DAILY",
+                "from_symbol": from_sym,
+                "to_symbol":   to_sym,
+                "outputsize":  "compact",
+                "apikey":      settings.alpha_vantage_key,
+            })
+            return r.json().get("Time Series FX (Daily)", {})
+    except Exception:
+        return {}
+
+
+async def _fred_latest(series_id: str) -> Optional[float]:
+    """Get latest value for a FRED series."""
+    if not settings.fred_api_key:
         return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                "https://api.stlouisfed.org/fred/series/observations",
+                params={
+                    "series_id":  series_id,
+                    "api_key":    settings.fred_api_key,
+                    "file_type":  "json",
+                    "sort_order": "desc",
+                    "limit":      1,
+                }
+            )
+            obs = r.json().get("observations", [])
+            if obs and obs[0]["value"] != ".":
+                return float(obs[0]["value"])
+    except Exception:
+        pass
+    return None
 
-
-async def _td_52w(symbol: str) -> tuple[Optional[float], Optional[float]]:
-    """Returns (52w_high, 52w_low) from 1-year daily data."""
-    series = await _td_time_series(symbol, outputsize=252)
-    if not series:
-        return None, None
-    highs = [float(c["high"]) for c in series if c.get("high")]
-    lows  = [float(c["low"])  for c in series if c.get("low")]
-    return (round(max(highs), 4), round(min(lows), 4)) if highs else (None, None)
-
-
-# ── Public functions ───────────────────────────────────────────
 
 async def get_commodity_data(symbol: str) -> dict:
-    td_sym = COMMODITY_TD.get(symbol.upper())
-    if not td_sym:
-        return {"error": f"Unknown symbol: {symbol}"}
+    """
+    Fetches commodity data via Alpha Vantage commodity endpoint.
+    Returns price, 52W high/low, RSI-14, SMA-20, SMA-50, price history.
+    """
+    av_function = COMMODITY_AV.get(symbol.upper())
+    if not av_function:
+        return {"error": f"Unknown symbol: {symbol}. Valid: {list(COMMODITY_AV.keys())}"}
 
     try:
-        # Fetch price + time series + indicators concurrently
-        # TD free = 8 calls/min — we batch carefully
-        price_task   = _td_price(td_sym)
-        series_task  = _td_time_series(td_sym, outputsize=60)
-        rsi_task     = _td_indicator(td_sym, "rsi",  time_period=14)
-        sma20_task   = _td_indicator(td_sym, "sma",  time_period=20)
-        sma50_task   = _td_indicator(td_sym, "sma",  time_period=50)
+        rows = await _av_commodity(av_function)
 
-        price, series, rsi, sma20, sma50 = await asyncio.gather(
-            price_task, series_task, rsi_task, sma20_task, sma50_task
-        )
+        if not rows:
+            return {"error": f"No data from Alpha Vantage for {symbol}", "symbol": symbol}
 
-        # 52w high/low from series
-        hi52w, lo52w = None, None
-        if series:
-            highs = [float(c["high"]) for c in series if c.get("high")]
-            lows  = [float(c["low"])  for c in series if c.get("low")]
-            hi52w = round(max(highs), 4) if highs else None
-            lo52w = round(min(lows),  4) if lows  else None
-
-        pct_from_high = (
-            round((price - hi52w) / hi52w * 100, 2)
-            if price and hi52w else None
-        )
-
+        # Extract close prices from monthly data
+        closes = []
         price_history = []
-        for candle in series:
+        for row in rows[-60:]:  # last 60 months max
             try:
+                val = float(row["value"])
+                closes.append(val)
                 price_history.append({
-                    "date":   candle["datetime"],
-                    "open":   round(float(candle["open"]),   4),
-                    "high":   round(float(candle["high"]),   4),
-                    "low":    round(float(candle["low"]),    4),
-                    "close":  round(float(candle["close"]),  4),
-                    "volume": int(float(candle.get("volume", 0))),
+                    "date":  row["date"],
+                    "close": round(val, 4),
                 })
             except Exception:
                 continue
 
+        if not closes:
+            return {"error": "Empty price data", "symbol": symbol}
+
+        current_price = closes[-1]
+        week_52_high  = round(max(closes[-12:]), 4)   # last 12 months
+        week_52_low   = round(min(closes[-12:]), 4)
+        pct_from_high = round((current_price - week_52_high) / week_52_high * 100, 2) if week_52_high else 0
+
+        sma_20 = round(sum(closes[-20:]) / min(20, len(closes)), 2) if len(closes) >= 5 else None
+        sma_50 = round(sum(closes[-50:]) / min(50, len(closes)), 2) if len(closes) >= 5 else None
+        rsi    = _calculate_rsi(closes)
+
         return {
-            "symbol":           symbol,
-            "ticker":           td_sym,
-            "current_price":    price,
-            "currency":         "USD",
-            "week_52_high":     hi52w,
-            "week_52_low":      lo52w,
+            "symbol":            symbol,
+            "ticker":            av_function,
+            "current_price":     round(current_price, 4),
+            "currency":          "USD",
+            "week_52_high":      week_52_high,
+            "week_52_low":       week_52_low,
             "pct_from_52w_high": pct_from_high,
-            "sma_20":           sma20,
-            "sma_50":           sma50,
-            "rsi_14":           rsi,
-            "price_history":    price_history,
-            "fetched_at":       datetime.utcnow().isoformat(),
+            "volume":            None,  # AV commodity doesn't provide volume
+            "sma_20":            sma_20,
+            "sma_50":            sma_50,
+            "rsi_14":            rsi,
+            "price_history":     price_history[-60:],
+            "fetched_at":        datetime.utcnow().isoformat(),
         }
 
     except Exception as e:
@@ -170,77 +200,76 @@ async def get_commodity_data(symbol: str) -> dict:
 
 async def get_equity_data(ticker: str) -> dict:
     """
-    Equity data via Twelve Data.
-    For Indian stocks use BSE/NSE suffix e.g. "RELIANCE:NSE"
-    For US stocks just the ticker e.g. "AAPL"
-    Fundamentals (PE, PB etc.) not available on TD free tier —
-    those fields will be None. Price + technicals work fine.
+    Fetches equity data via Alpha Vantage.
+    Use NSE stocks as US-listed ADRs or just use ticker directly.
+    For Indian stocks: try BSE/NSE listed tickers like 'RELIANCE.BSE'
     """
     try:
-        price_task  = _td_price(ticker)
-        series_task = _td_time_series(ticker, outputsize=60)
-        rsi_task    = _td_indicator(ticker, "rsi",  time_period=14)
-        sma50_task  = _td_indicator(ticker, "sma",  time_period=50)
-        sma200_task = _td_indicator(ticker, "sma",  time_period=200)
+        quote_task = _av_quote(ticker)
+        daily_task = _av_daily(ticker, outputsize="full")
 
-        price, series, rsi, sma50, sma200 = await asyncio.gather(
-            price_task, series_task, rsi_task, sma50_task, sma200_task
-        )
+        quote, daily = await asyncio.gather(quote_task, daily_task)
 
-        hi52w, lo52w = None, None
-        if series:
-            highs = [float(c["high"]) for c in series if c.get("high")]
-            lows  = [float(c["low"])  for c in series if c.get("low")]
-            hi52w = round(max(highs), 2) if highs else None
-            lo52w = round(min(lows),  2) if lows  else None
+        if not daily:
+            return {"error": f"No data for {ticker}", "ticker": ticker}
+
+        # Sort dates oldest to newest
+        sorted_dates = sorted(daily.keys())
+        closes = [float(daily[d]["4. close"]) for d in sorted_dates]
 
         price_history = []
-        for candle in series:
+        for d in sorted_dates[-60:]:
             try:
                 price_history.append({
-                    "date":   candle["datetime"],
-                    "close":  round(float(candle["close"]), 2),
-                    "volume": int(float(candle.get("volume", 0))),
+                    "date":   d,
+                    "close":  round(float(daily[d]["4. close"]), 2),
+                    "volume": int(float(daily[d]["5. volume"])),
                 })
             except Exception:
                 continue
 
+        current_price = float(quote.get("05. price", closes[-1] if closes else 0))
+        hi52  = round(max([float(daily[d]["2. high"]) for d in sorted_dates[-252:]]), 2) if len(sorted_dates) >= 5 else None
+        lo52  = round(min([float(daily[d]["3. low"])  for d in sorted_dates[-252:]]), 2) if len(sorted_dates) >= 5 else None
+
+        sma_50  = round(sum(closes[-50:])  / min(50, len(closes)),  2) if len(closes) >= 5 else None
+        sma_200 = round(sum(closes[-200:]) / min(200, len(closes)), 2) if len(closes) >= 5 else None
+        rsi     = _calculate_rsi(closes)
+
         return {
-            "ticker":        ticker,
-            "company_name":  ticker,       # TD free doesn't give company name
-            "current_price": price,
-            "currency":      "INR",
-            "week_52_high":  hi52w,
-            "week_52_low":   lo52w,
-            "sma_50":        sma50,
-            "sma_200":       sma200,
-            "rsi_14":        rsi,
-            "price_history": price_history,
-            # Fundamentals below — None on free tier
-            # Upgrade TD plan or add separate BSE/NSE scraper later
-            "sector":                None,
-            "industry":              None,
-            "market_cap":            None,
-            "pe_ratio":              None,
-            "forward_pe":            None,
-            "pb_ratio":              None,
-            "ev_ebitda":             None,
-            "revenue":               None,
-            "revenue_growth":        None,
-            "gross_margin":          None,
-            "operating_margin":      None,
-            "profit_margin":         None,
-            "roe":                   None,
-            "roa":                   None,
-            "debt_to_equity":        None,
-            "current_ratio":         None,
-            "free_cashflow":         None,
-            "dividend_yield":        None,
-            "beta":                  None,
-            "analyst_target_price":  None,
-            "analyst_recommendation":None,
-            "analyst_count":         None,
-            "fetched_at":            datetime.utcnow().isoformat(),
+            "ticker":                 ticker,
+            "company_name":           ticker,
+            "sector":                 None,
+            "industry":               None,
+            "market_cap":             None,
+            "current_price":          round(current_price, 2),
+            "currency":               "USD",
+            "pe_ratio":               None,
+            "forward_pe":             None,
+            "pb_ratio":               None,
+            "ev_ebitda":              None,
+            "revenue":                None,
+            "revenue_growth":         None,
+            "gross_margin":           None,
+            "operating_margin":       None,
+            "profit_margin":          None,
+            "roe":                    None,
+            "roa":                    None,
+            "debt_to_equity":         None,
+            "current_ratio":          None,
+            "free_cashflow":          None,
+            "dividend_yield":         None,
+            "week_52_high":           hi52,
+            "week_52_low":            lo52,
+            "beta":                   None,
+            "analyst_target_price":   None,
+            "analyst_recommendation": None,
+            "analyst_count":          None,
+            "sma_50":                 sma_50,
+            "sma_200":                sma_200,
+            "rsi_14":                 rsi,
+            "price_history":          price_history,
+            "fetched_at":             datetime.utcnow().isoformat(),
         }
 
     except Exception as e:
@@ -249,26 +278,57 @@ async def get_equity_data(ticker: str) -> dict:
 
 async def get_macro_snapshot() -> dict:
     """
-    Macro indicators via Twelve Data.
-    All fetched concurrently — no sleep needed (TD is reliable).
+    Macro indicators:
+    - USD/INR via Alpha Vantage FX
+    - US 10Y yield, DXY, VIX via FRED
+    - Gold-Silver ratio derived from commodity data
     """
     results = {}
 
-    async def _fetch_one(name: str, sym: str):
-        price = await _td_price(sym)
-        results[name] = {
-            "value":          price,
-            "change_pct_1d":  None,   # would need 2 calls — skip for now
-        }
+    # Forex via AV
+    try:
+        fx_data = await _av_forex_daily("USD", "INR")
+        if fx_data:
+            latest_date = sorted(fx_data.keys())[-1]
+            prev_date   = sorted(fx_data.keys())[-2] if len(fx_data) >= 2 else None
+            latest = float(fx_data[latest_date]["4. close"])
+            prev   = float(fx_data[prev_date]["4. close"]) if prev_date else None
+            change = round((latest - prev) / prev * 100, 2) if prev else None
+            results["USDINR"] = {"value": round(latest, 4), "change_pct_1d": change}
+    except Exception as e:
+        results["USDINR"] = {"error": str(e)}
 
-    tasks = [_fetch_one(name, sym) for name, sym in MACRO_TD.items()]
-    await asyncio.gather(*tasks)
+    # Macro from FRED concurrently
+    fred_tasks = {
+        "US_10Y_YIELD": _fred_latest("GS10"),
+        "DXY":          _fred_latest("DTWEXBGS"),
+        "VIX_US":       _fred_latest("VIXCLS"),
+    }
+
+    fred_results = await asyncio.gather(*fred_tasks.values())
+    for key, val in zip(fred_tasks.keys(), fred_results):
+        results[key] = {"value": val, "change_pct_1d": None}
+
+    # Nifty — AV supports Indian indices via BSE
+    try:
+        nifty_quote = await _av_quote("^NSEI")
+        if nifty_quote:
+            results["NIFTY50"] = {
+                "value": float(nifty_quote.get("05. price", 0)) or None,
+                "change_pct_1d": None,
+            }
+    except Exception:
+        results["NIFTY50"] = {"value": None}
 
     # Gold-Silver ratio
     try:
-        gold_p   = await _td_price("XAU/USD")
-        silver_p = await _td_price("XAG/USD")
-        if gold_p and silver_p:
+        gold_task   = _av_commodity("GOLD")
+        silver_task = _av_commodity("SILVER")
+        gold_rows, silver_rows = await asyncio.gather(gold_task, silver_task)
+
+        if gold_rows and silver_rows:
+            gold_p   = float(gold_rows[-1]["value"])
+            silver_p = float(silver_rows[-1]["value"])
             results["GOLD_SILVER_RATIO"] = {
                 "value": round(gold_p / silver_p, 2)
             }
@@ -280,7 +340,7 @@ async def get_macro_snapshot() -> dict:
 
 
 async def get_fred_data() -> dict:
-    """US macro data from FRED API — reliable, official, always works."""
+    """Full FRED macro data — Fed rate, CPI, PCE, unemployment, GDP."""
     if not settings.fred_api_key:
         return {"error": "FRED API key not configured"}
 
@@ -324,6 +384,7 @@ async def get_fred_data() -> dict:
 
 
 async def get_news(query: str, page_size: int = 10) -> list:
+    """Latest news from NewsAPI for a given query."""
     if not settings.news_api_key:
         return []
     try:
