@@ -1,3 +1,6 @@
+"""
+main.py — FinSight AI FastAPI entry point
+"""
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
@@ -9,12 +12,7 @@ from typing import Optional
 import uuid
 
 from core.config import get_settings
-from core.auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    get_current_user,
-)
+from core.auth import hash_password, verify_password, create_access_token, get_current_user
 from models.database import get_db, User, Report
 from tasks.report_task import generate_report
 
@@ -35,7 +33,7 @@ app.add_middleware(
 )
 
 
-# ── Pydantic schemas ───────────────────────────────────────────
+# ── Schemas ────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -53,7 +51,7 @@ class TokenResponse(BaseModel):
 
 class GenerateReportRequest(BaseModel):
     asset_type: str        # "commodity" | "equity"
-    asset_symbol: str      # "SILVER" | "GOLD" | "RELIANCE:NSE"
+    asset_symbol: str
     analysis_type: str = "full"
 
 
@@ -68,7 +66,7 @@ class ReportStatusResponse(BaseModel):
     completed_at: Optional[str]
 
 
-# ── Health check ───────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -80,17 +78,13 @@ async def health():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
-# ── Auth routes ────────────────────────────────────────────────
+# ── Auth ───────────────────────────────────────────────────────
 
 @app.post("/auth/register", response_model=TokenResponse)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    # Check if email already exists
     result = await db.execute(select(User).where(User.email == body.email))
     if result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered",
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email already registered")
 
     user = User(
         id=str(uuid.uuid4()),
@@ -104,35 +98,19 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.refresh(user)
 
     token = create_access_token({"sub": user.id})
-    return TokenResponse(
-        access_token=token,
-        user_id=user.id,
-        email=user.email,
-        tier=user.tier,
-    )
+    return TokenResponse(access_token=token, user_id=user.id, email=user.email, tier=user.tier)
 
 
 @app.post("/auth/login", response_model=TokenResponse)
-async def login(
-    form: OAuth2PasswordRequestForm = Depends(),
-    db: AsyncSession = Depends(get_db),
-):
+async def login(form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == form.username))
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(form.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
 
     token = create_access_token({"sub": user.id})
-    return TokenResponse(
-        access_token=token,
-        user_id=user.id,
-        email=user.email,
-        tier=user.tier,
-    )
+    return TokenResponse(access_token=token, user_id=user.id, email=user.email, tier=user.tier)
 
 
 @app.get("/auth/me")
@@ -146,17 +124,10 @@ async def me(current_user: User = Depends(get_current_user)):
     }
 
 
-# ── Report routes ──────────────────────────────────────────────
+# ── Reports ────────────────────────────────────────────────────
 
-TIER_LIMITS = {
-    "free":     3,
-    "basic":    20,
-    "pro":      100,
-    "business": 999999,
-}
-
-VALID_ASSET_TYPES   = {"commodity", "equity"}
-VALID_COMMODITIES   = {"SILVER", "GOLD", "CRUDE_BRENT", "CRUDE_WTI", "NATURAL_GAS", "COPPER"}
+TIER_LIMITS = {"free": 3, "basic": 20, "pro": 100, "business": 999999}
+VALID_ASSET_TYPES = {"commodity", "equity"}
 
 
 @app.post("/reports/generate")
@@ -165,15 +136,13 @@ async def generate(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Validate asset type
     if body.asset_type not in VALID_ASSET_TYPES:
-        raise HTTPException(400, f"Invalid asset_type. Choose from: {VALID_ASSET_TYPES}")
+        raise HTTPException(400, f"Invalid asset_type. Choose: {VALID_ASSET_TYPES}")
 
-    # Check monthly usage limit
     month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     count_result = await db.execute(
         select(func.count(Report.id)).where(
-            Report.user_id   == current_user.id,
+            Report.user_id    == current_user.id,
             Report.created_at >= month_start,
         )
     )
@@ -182,13 +151,13 @@ async def generate(
 
     if monthly_count >= limit:
         raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Monthly limit of {limit} reports reached for {current_user.tier} tier.",
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"Monthly limit of {limit} reports reached for {current_user.tier} tier.",
         )
 
-    # Create report record
+    report_id = str(uuid.uuid4())
     report = Report(
-        id=str(uuid.uuid4()),
+        id=report_id,
         user_id=current_user.id,
         asset_type=body.asset_type,
         asset_symbol=body.asset_symbol.upper(),
@@ -196,27 +165,24 @@ async def generate(
         status="queued",
     )
     db.add(report)
-    await db.commit()
-    await db.refresh(report)
+    await db.flush()   # get the record in DB before queuing task
 
-    # Queue Celery task
+    # Queue task THEN save task id — single commit
     task = generate_report.delay(
-        report.id,
+        report_id,
         body.asset_type,
         body.asset_symbol.upper(),
         body.analysis_type,
         current_user.id,
     )
-
-    # Save celery task id
     report.celery_task_id = task.id
     await db.commit()
 
     return {
-        "report_id":  report.id,
-        "status":     "queued",
-        "message":    "Report generation started. Poll /reports/{id} for status.",
-        "task_id":    task.id,
+        "report_id": report_id,
+        "status":    "queued",
+        "message":   "Report generation started. Poll /reports/{id} for status.",
+        "task_id":   task.id,
     }
 
 
@@ -227,13 +193,9 @@ async def get_report_status(
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(Report).where(
-            Report.id      == report_id,
-            Report.user_id == current_user.id,
-        )
+        select(Report).where(Report.id == report_id, Report.user_id == current_user.id)
     )
     report = result.scalar_one_or_none()
-
     if not report:
         raise HTTPException(404, "Report not found")
 
@@ -261,7 +223,6 @@ async def list_reports(
         .limit(50)
     )
     reports = result.scalars().all()
-
     return {
         "reports": [
             {
@@ -286,15 +247,11 @@ async def delete_report(
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(Report).where(
-            Report.id      == report_id,
-            Report.user_id == current_user.id,
-        )
+        select(Report).where(Report.id == report_id, Report.user_id == current_user.id)
     )
     report = result.scalar_one_or_none()
     if not report:
         raise HTTPException(404, "Report not found")
-
     await db.delete(report)
     await db.commit()
     return {"message": "Report deleted"}

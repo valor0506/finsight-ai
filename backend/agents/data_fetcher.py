@@ -1,14 +1,28 @@
+"""
+agents/data_fetcher.py
+
+Data sources:
+  - Alpha Vantage  → commodities (monthly OHLC), equities (daily), forex
+  - FRED           → macro indicators (10Y yield, DXY, VIX, Fed rate, CPI, etc.)
+  - NewsAPI        → latest headlines
+
+Rate limit reality:
+  - AV free tier: 25 requests/day, 5/min  → we add 12s delay between calls
+  - FRED free tier: generous, no hard limit
+  - NewsAPI free tier: 100 req/day
+"""
 import httpx
+import asyncio
 from datetime import datetime
 from typing import Optional
 from core.config import get_settings
-import asyncio
 
 settings = get_settings()
 
-AV_BASE = "https://www.alphavantage.co/query"
+AV_BASE   = "https://www.alphavantage.co/query"
+AV_DELAY  = 12.0   # seconds between AV calls (5 req/min limit)
 
-# Alpha Vantage commodity function map
+# Alpha Vantage commodity function names
 COMMODITY_AV = {
     "SILVER":      "SILVER",
     "GOLD":        "GOLD",
@@ -19,25 +33,15 @@ COMMODITY_AV = {
     "ALUMINIUM":   "ALUMINUM",
 }
 
-# Alpha Vantage forex pairs for macro
-MACRO_FOREX = {
-    "USDINR": ("USD", "INR"),
-}
 
-# These come from FRED — more reliable than AV for macro
-FRED_MACRO = {
-    "US_10Y_YIELD": "GS10",
-    "DXY":          "DTWEXBGS",
-    "VIX_US":       "VIXCLS",
-}
-
+# ── RSI calculation ────────────────────────────────────────────
 
 def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
     if len(closes) < period + 1:
         return None
-    deltas   = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains    = [d if d > 0 else 0 for d in deltas]
-    losses   = [abs(d) if d < 0 else 0 for d in deltas]
+    deltas   = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains    = [d if d > 0 else 0.0 for d in deltas]
+    losses   = [abs(d) if d < 0 else 0.0 for d in deltas]
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
@@ -45,76 +49,65 @@ def _calculate_rsi(closes: list, period: int = 14) -> Optional[float]:
     return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
 
 
-async def _av_commodity(function: str) -> list:
-    """
-    Fetch monthly commodity data from Alpha Vantage.
-    Returns list of {date, value} dicts sorted oldest to newest.
-    """
+# ── Alpha Vantage helpers ──────────────────────────────────────
+
+async def _av_get(params: dict) -> dict:
+    """Single AV request with error handling. Returns raw JSON or {}."""
+    if not settings.alpha_vantage_key:
+        return {"_error": "ALPHA_VANTAGE_KEY not set in .env"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(AV_BASE, params={
-                "function": function,
-                "interval": "monthly",
-                "apikey":   settings.alpha_vantage_key,
-            })
+            params["apikey"] = settings.alpha_vantage_key
+            r = await client.get(AV_BASE, params=params)
             data = r.json()
-            rows = data.get("data", [])
-            # AV returns newest first — reverse
-            return list(reversed(rows))
-    except Exception:
+            # AV returns this when rate limited
+            if "Note" in data or "Information" in data:
+                note = data.get("Note") or data.get("Information", "")
+                return {"_error": f"AV rate limit: {note[:100]}"}
+            return data
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+async def _av_commodity(function: str) -> list:
+    """
+    Monthly commodity data from AV.
+    Returns list of {date, value} sorted oldest→newest.
+    """
+    data = await _av_get({"function": function, "interval": "monthly"})
+    if "_error" in data:
         return []
+    rows = data.get("data", [])
+    return list(reversed(rows))   # AV gives newest first
 
 
 async def _av_quote(symbol: str) -> dict:
-    """Get current quote for a stock/ETF symbol."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(AV_BASE, params={
-                "function": "GLOBAL_QUOTE",
-                "symbol":   symbol,
-                "apikey":   settings.alpha_vantage_key,
-            })
-            return r.json().get("Global Quote", {})
-    except Exception:
-        return {}
+    data = await _av_get({"function": "GLOBAL_QUOTE", "symbol": symbol})
+    return data.get("Global Quote", {})
 
 
 async def _av_daily(symbol: str, outputsize: str = "compact") -> dict:
-    """
-    Get daily OHLCV for a stock symbol.
-    outputsize: "compact" = last 100 days, "full" = 20 years
-    """
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(AV_BASE, params={
-                "function":   "TIME_SERIES_DAILY",
-                "symbol":     symbol,
-                "outputsize": outputsize,
-                "apikey":     settings.alpha_vantage_key,
-            })
-            return r.json().get("Time Series (Daily)", {})
-    except Exception:
-        return {}
+    data = await _av_get({
+        "function":   "TIME_SERIES_DAILY",
+        "symbol":     symbol,
+        "outputsize": outputsize,
+    })
+    return data.get("Time Series (Daily)", {})
 
 
 async def _av_forex_daily(from_sym: str, to_sym: str) -> dict:
-    """Get daily forex rate history."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(AV_BASE, params={
-                "function":    "FX_DAILY",
-                "from_symbol": from_sym,
-                "to_symbol":   to_sym,
-                "outputsize":  "compact",
-                "apikey":      settings.alpha_vantage_key,
-            })
-            return r.json().get("Time Series FX (Daily)", {})
-    except Exception:
-        return {}
+    data = await _av_get({
+        "function":    "FX_DAILY",
+        "from_symbol": from_sym,
+        "to_symbol":   to_sym,
+        "outputsize":  "compact",
+    })
+    return data.get("Time Series FX (Daily)", {})
 
+
+# ── FRED helpers ───────────────────────────────────────────────
 
 async def _fred_latest(series_id: str) -> Optional[float]:
-    """Get latest value for a FRED series."""
     if not settings.fred_api_key:
         return None
     try:
@@ -127,7 +120,7 @@ async def _fred_latest(series_id: str) -> Optional[float]:
                     "file_type":  "json",
                     "sort_order": "desc",
                     "limit":      1,
-                }
+                },
             )
             obs = r.json().get("observations", [])
             if obs and obs[0]["value"] != ".":
@@ -137,214 +130,175 @@ async def _fred_latest(series_id: str) -> Optional[float]:
     return None
 
 
+# ── Public data functions ──────────────────────────────────────
+
 async def get_commodity_data(symbol: str) -> dict:
     """
-    Fetches commodity data via Alpha Vantage commodity endpoint.
-    Returns price, 52W high/low, RSI-14, SMA-20, SMA-50, price history.
+    Returns price, technicals, and price history for a commodity.
+    Uses AV monthly data → calculates RSI, SMA locally.
     """
     av_function = COMMODITY_AV.get(symbol.upper())
     if not av_function:
         return {"error": f"Unknown symbol: {symbol}. Valid: {list(COMMODITY_AV.keys())}"}
 
-    try:
-        rows = await _av_commodity(av_function)
+    if not settings.alpha_vantage_key:
+        return {"error": "ALPHA_VANTAGE_KEY is not set in your .env file"}
 
-        if not rows:
-            return {"error": f"No data from Alpha Vantage for {symbol}", "symbol": symbol}
+    rows = await _av_commodity(av_function)
 
-        # Extract close prices from monthly data
-        closes = []
-        price_history = []
-        for row in rows[-60:]:  # last 60 months max
-            try:
-                val = float(row["value"])
-                closes.append(val)
-                price_history.append({
-                    "date":  row["date"],
-                    "close": round(val, 4),
-                })
-            except Exception:
-                continue
-
-        if not closes:
-            return {"error": "Empty price data", "symbol": symbol}
-
-        current_price = closes[-1]
-        week_52_high  = round(max(closes[-12:]), 4)   # last 12 months
-        week_52_low   = round(min(closes[-12:]), 4)
-        pct_from_high = round((current_price - week_52_high) / week_52_high * 100, 2) if week_52_high else 0
-
-        sma_20 = round(sum(closes[-20:]) / min(20, len(closes)), 2) if len(closes) >= 5 else None
-        sma_50 = round(sum(closes[-50:]) / min(50, len(closes)), 2) if len(closes) >= 5 else None
-        rsi    = _calculate_rsi(closes)
-
+    if not rows:
         return {
-            "symbol":            symbol,
-            "ticker":            av_function,
-            "current_price":     round(current_price, 4),
-            "currency":          "USD",
-            "week_52_high":      week_52_high,
-            "week_52_low":       week_52_low,
-            "pct_from_52w_high": pct_from_high,
-            "volume":            None,  # AV commodity doesn't provide volume
-            "sma_20":            sma_20,
-            "sma_50":            sma_50,
-            "rsi_14":            rsi,
-            "price_history":     price_history[-60:],
-            "fetched_at":        datetime.utcnow().isoformat(),
+            "error": (
+                f"Alpha Vantage returned no data for {symbol}. "
+                "Likely cause: free tier rate limit (25 req/day) or invalid API key. "
+                f"Key used: {settings.alpha_vantage_key[:6]}..."
+            ),
+            "symbol": symbol,
         }
 
-    except Exception as e:
-        return {"error": str(e), "symbol": symbol}
+    closes        = []
+    price_history = []
+    for row in rows[-60:]:
+        try:
+            val = float(row["value"])
+            closes.append(val)
+            price_history.append({"date": row["date"], "close": round(val, 4)})
+        except Exception:
+            continue
+
+    if not closes:
+        return {"error": "Price data is empty after parsing", "symbol": symbol}
+
+    current_price = closes[-1]
+    last_12       = closes[-12:] if len(closes) >= 12 else closes
+    week_52_high  = round(max(last_12), 4)
+    week_52_low   = round(min(last_12), 4)
+    pct_from_high = round((current_price - week_52_high) / week_52_high * 100, 2)
+
+    sma_20 = round(sum(closes[-20:]) / min(20, len(closes)), 2) if len(closes) >= 5 else None
+    sma_50 = round(sum(closes[-50:]) / min(50, len(closes)), 2) if len(closes) >= 5 else None
+    rsi    = _calculate_rsi(closes)
+
+    return {
+        "symbol":            symbol,
+        "ticker":            av_function,
+        "current_price":     round(current_price, 4),
+        "currency":          "USD",
+        "week_52_high":      week_52_high,
+        "week_52_low":       week_52_low,
+        "pct_from_52w_high": pct_from_high,
+        "sma_20":            sma_20,
+        "sma_50":            sma_50,
+        "rsi_14":            rsi,
+        "price_history":     price_history[-60:],
+        "fetched_at":        datetime.utcnow().isoformat(),
+    }
 
 
 async def get_equity_data(ticker: str) -> dict:
-    """
-    Fetches equity data via Alpha Vantage.
-    Use NSE stocks as US-listed ADRs or just use ticker directly.
-    For Indian stocks: try BSE/NSE listed tickers like 'RELIANCE.BSE'
-    """
-    try:
-        quote_task = _av_quote(ticker)
-        daily_task = _av_daily(ticker, outputsize="full")
+    """Equity data via AV daily time series."""
+    if not settings.alpha_vantage_key:
+        return {"error": "ALPHA_VANTAGE_KEY is not set in your .env file"}
 
-        quote, daily = await asyncio.gather(quote_task, daily_task)
+    quote, daily = await asyncio.gather(
+        _av_quote(ticker),
+        _av_daily(ticker, outputsize="full"),
+    )
 
-        if not daily:
-            return {"error": f"No data for {ticker}", "ticker": ticker}
+    if not daily:
+        return {"error": f"No daily data returned for {ticker}. Check ticker or AV rate limit.", "ticker": ticker}
 
-        # Sort dates oldest to newest
-        sorted_dates = sorted(daily.keys())
-        closes = [float(daily[d]["4. close"]) for d in sorted_dates]
+    sorted_dates = sorted(daily.keys())
+    closes = [float(daily[d]["4. close"]) for d in sorted_dates]
 
-        price_history = []
-        for d in sorted_dates[-60:]:
-            try:
-                price_history.append({
-                    "date":   d,
-                    "close":  round(float(daily[d]["4. close"]), 2),
-                    "volume": int(float(daily[d]["5. volume"])),
-                })
-            except Exception:
-                continue
-
-        current_price = float(quote.get("05. price", closes[-1] if closes else 0))
-        hi52  = round(max([float(daily[d]["2. high"]) for d in sorted_dates[-252:]]), 2) if len(sorted_dates) >= 5 else None
-        lo52  = round(min([float(daily[d]["3. low"])  for d in sorted_dates[-252:]]), 2) if len(sorted_dates) >= 5 else None
-
-        sma_50  = round(sum(closes[-50:])  / min(50, len(closes)),  2) if len(closes) >= 5 else None
-        sma_200 = round(sum(closes[-200:]) / min(200, len(closes)), 2) if len(closes) >= 5 else None
-        rsi     = _calculate_rsi(closes)
-
-        return {
-            "ticker":                 ticker,
-            "company_name":           ticker,
-            "sector":                 None,
-            "industry":               None,
-            "market_cap":             None,
-            "current_price":          round(current_price, 2),
-            "currency":               "USD",
-            "pe_ratio":               None,
-            "forward_pe":             None,
-            "pb_ratio":               None,
-            "ev_ebitda":              None,
-            "revenue":                None,
-            "revenue_growth":         None,
-            "gross_margin":           None,
-            "operating_margin":       None,
-            "profit_margin":          None,
-            "roe":                    None,
-            "roa":                    None,
-            "debt_to_equity":         None,
-            "current_ratio":          None,
-            "free_cashflow":          None,
-            "dividend_yield":         None,
-            "week_52_high":           hi52,
-            "week_52_low":            lo52,
-            "beta":                   None,
-            "analyst_target_price":   None,
-            "analyst_recommendation": None,
-            "analyst_count":          None,
-            "sma_50":                 sma_50,
-            "sma_200":                sma_200,
-            "rsi_14":                 rsi,
-            "price_history":          price_history,
-            "fetched_at":             datetime.utcnow().isoformat(),
+    price_history = [
+        {
+            "date":   d,
+            "close":  round(float(daily[d]["4. close"]), 2),
+            "volume": int(float(daily[d]["5. volume"])),
         }
+        for d in sorted_dates[-60:]
+    ]
 
-    except Exception as e:
-        return {"error": str(e), "ticker": ticker}
+    current_price = float(quote.get("05. price", closes[-1] if closes else 0))
+    hi52  = round(max(float(daily[d]["2. high"]) for d in sorted_dates[-252:]), 2) if len(sorted_dates) >= 5 else None
+    lo52  = round(min(float(daily[d]["3. low"])  for d in sorted_dates[-252:]), 2) if len(sorted_dates) >= 5 else None
+    sma_50  = round(sum(closes[-50:])  / min(50,  len(closes)), 2) if closes else None
+    sma_200 = round(sum(closes[-200:]) / min(200, len(closes)), 2) if closes else None
+    rsi     = _calculate_rsi(closes)
+
+    return {
+        "ticker":        ticker,
+        "current_price": round(current_price, 2),
+        "currency":      "USD",
+        "week_52_high":  hi52,
+        "week_52_low":   lo52,
+        "sma_50":        sma_50,
+        "sma_200":       sma_200,
+        "rsi_14":        rsi,
+        "price_history": price_history,
+        "fetched_at":    datetime.utcnow().isoformat(),
+    }
 
 
 async def get_macro_snapshot() -> dict:
     """
-    Macro indicators:
-    - USD/INR via Alpha Vantage FX
-    - US 10Y yield, DXY, VIX via FRED
-    - Gold-Silver ratio derived from commodity data
+    Macro indicators — FRED is preferred (no rate limit issues).
+    AV calls are sequential with delay to avoid 5/min limit.
     """
     results = {}
 
-    # Forex via AV
-    try:
-        fx_data = await _av_forex_daily("USD", "INR")
-        if fx_data:
-            latest_date = sorted(fx_data.keys())[-1]
-            prev_date   = sorted(fx_data.keys())[-2] if len(fx_data) >= 2 else None
-            latest = float(fx_data[latest_date]["4. close"])
-            prev   = float(fx_data[prev_date]["4. close"]) if prev_date else None
-            change = round((latest - prev) / prev * 100, 2) if prev else None
-            results["USDINR"] = {"value": round(latest, 4), "change_pct_1d": change}
-    except Exception as e:
-        results["USDINR"] = {"error": str(e)}
-
-    # Macro from FRED concurrently
-    fred_tasks = {
-        "US_10Y_YIELD": _fred_latest("GS10"),
-        "DXY":          _fred_latest("DTWEXBGS"),
-        "VIX_US":       _fred_latest("VIXCLS"),
+    # ── FRED (concurrent, no rate limit) ──
+    fred_keys = {
+        "US_10Y_YIELD": "GS10",
+        "DXY":          "DTWEXBGS",
+        "VIX_US":       "VIXCLS",
     }
-
-    fred_results = await asyncio.gather(*fred_tasks.values())
-    for key, val in zip(fred_tasks.keys(), fred_results):
+    fred_vals = await asyncio.gather(*[_fred_latest(sid) for sid in fred_keys.values()])
+    for key, val in zip(fred_keys.keys(), fred_vals):
         results[key] = {"value": val, "change_pct_1d": None}
 
-    # Nifty — AV supports Indian indices via BSE
+    # ── AV Forex — sequential with delay ──
+    await asyncio.sleep(AV_DELAY)
     try:
-        nifty_quote = await _av_quote("^NSEI")
-        if nifty_quote:
-            results["NIFTY50"] = {
-                "value": float(nifty_quote.get("05. price", 0)) or None,
-                "change_pct_1d": None,
-            }
-    except Exception:
-        results["NIFTY50"] = {"value": None}
+        fx = await _av_forex_daily("USD", "INR")
+        if fx:
+            dates  = sorted(fx.keys())
+            latest = float(fx[dates[-1]]["4. close"])
+            prev   = float(fx[dates[-2]]["4. close"]) if len(dates) >= 2 else None
+            change = round((latest - prev) / prev * 100, 2) if prev else None
+            results["USDINR"] = {"value": round(latest, 4), "change_pct_1d": change}
+        else:
+            results["USDINR"] = {"value": None}
+    except Exception as e:
+        results["USDINR"] = {"value": None, "error": str(e)}
 
-    # Gold-Silver ratio
-    try:
-        gold_task   = _av_commodity("GOLD")
-        silver_task = _av_commodity("SILVER")
-        gold_rows, silver_rows = await asyncio.gather(gold_task, silver_task)
+    # ── Gold-Silver ratio — sequential with delay ──
+    await asyncio.sleep(AV_DELAY)
+    gold_rows = await _av_commodity("GOLD")
+    await asyncio.sleep(AV_DELAY)
+    silver_rows = await _av_commodity("SILVER")
 
-        if gold_rows and silver_rows:
+    if gold_rows and silver_rows:
+        try:
             gold_p   = float(gold_rows[-1]["value"])
             silver_p = float(silver_rows[-1]["value"])
-            results["GOLD_SILVER_RATIO"] = {
-                "value": round(gold_p / silver_p, 2)
-            }
-    except Exception:
-        pass
+            results["GOLD_SILVER_RATIO"] = {"value": round(gold_p / silver_p, 2)}
+        except Exception:
+            results["GOLD_SILVER_RATIO"] = {"value": None}
+    else:
+        results["GOLD_SILVER_RATIO"] = {"value": None}
 
     results["fetched_at"] = datetime.utcnow().isoformat()
     return results
 
 
 async def get_fred_data() -> dict:
-    """Full FRED macro data — Fed rate, CPI, PCE, unemployment, GDP."""
+    """Full FRED macro data for India Macro module."""
     if not settings.fred_api_key:
-        return {"error": "FRED API key not configured"}
+        return {"error": "FRED_API_KEY not set in .env"}
 
-    fred_series = {
+    series = {
         "fed_funds_rate":     "FEDFUNDS",
         "cpi_yoy":            "CPIAUCSL",
         "core_pce":           "PCEPILFE",
@@ -352,20 +306,21 @@ async def get_fred_data() -> dict:
         "us_10y_yield":       "GS10",
         "us_real_gdp_growth": "A191RL1Q225SBEA",
     }
-
-    base_url = "https://api.stlouisfed.org/fred/series/observations"
-    results  = {}
+    results = {}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for name, series_id in fred_series.items():
+        for name, sid in series.items():
             try:
-                resp = await client.get(base_url, params={
-                    "series_id":  series_id,
-                    "api_key":    settings.fred_api_key,
-                    "file_type":  "json",
-                    "sort_order": "desc",
-                    "limit":      2,
-                })
+                resp = await client.get(
+                    "https://api.stlouisfed.org/fred/series/observations",
+                    params={
+                        "series_id":  sid,
+                        "api_key":    settings.fred_api_key,
+                        "file_type":  "json",
+                        "sort_order": "desc",
+                        "limit":      2,
+                    },
+                )
                 obs = resp.json().get("observations", [])
                 if obs:
                     val  = float(obs[0]["value"]) if obs[0]["value"] != "." else None
@@ -384,7 +339,7 @@ async def get_fred_data() -> dict:
 
 
 async def get_news(query: str, page_size: int = 10) -> list:
-    """Latest news from NewsAPI for a given query."""
+    """Latest news from NewsAPI."""
     if not settings.news_api_key:
         return []
     try:
@@ -397,7 +352,7 @@ async def get_news(query: str, page_size: int = 10) -> list:
                     "pageSize": page_size,
                     "sortBy":   "publishedAt",
                     "language": "en",
-                }
+                },
             )
             articles = resp.json().get("articles", [])
             return [
