@@ -1,203 +1,141 @@
 """
-test_apis.py — Run this FIRST before anything else.
-
-Usage:
-    cd backend
-    python test_apis.py
-
-This tests every API key and data fetch independently.
-If something returns None, this will tell you exactly why.
+test_apis.py — Run this before deploying.
+Usage: cd backend && python test_apis.py
 """
-import asyncio
-import os
-import sys
+import asyncio, os, sys
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# ── Check keys exist ───────────────────────────────────────────
 print("\n" + "="*55)
-print("  FinSight AI — API Key & Data Diagnostic")
+print("  FinSight AI — API Diagnostic v2")
 print("="*55)
 
-keys = {
-    "ALPHA_VANTAGE_KEY":  os.getenv("ALPHA_VANTAGE_KEY", ""),
-    "FRED_API_KEY":       os.getenv("FRED_API_KEY", ""),
-    "NEWS_API_KEY":       os.getenv("NEWS_API_KEY", ""),
-    "GEMINI_API_KEY":     os.getenv("GEMINI_API_KEY", ""),
-    "SUPABASE_URL":       os.getenv("SUPABASE_URL", ""),
-    "REDIS_URL":          os.getenv("REDIS_URL", ""),
+KEYS = {
+    "GEMINI_API_KEY":       os.getenv("GEMINI_API_KEY",""),
+    "FINNHUB_API_KEY":      os.getenv("FINNHUB_API_KEY",""),
+    "GROWW_API_KEY":        os.getenv("GROWW_API_KEY",""),
+    "GROWW_API_SECRET":     os.getenv("GROWW_API_SECRET",""),
+    "FRED_API_KEY":         os.getenv("FRED_API_KEY",""),
+    "NEWS_API_KEY":         os.getenv("NEWS_API_KEY",""),
+    "SUPABASE_URL":         os.getenv("SUPABASE_URL",""),
+    "SUPABASE_SERVICE_KEY": os.getenv("SUPABASE_SERVICE_KEY",""),
+    "DATABASE_URL":         os.getenv("DATABASE_URL",""),
+    "REDIS_URL":            os.getenv("REDIS_URL",""),
 }
 
 print("\n[1] ENV KEYS")
-all_ok = True
-for k, v in keys.items():
-    if v:
-        print(f"  ✓ {k}: {v[:8]}...")
-    else:
-        print(f"  ✗ {k}: NOT SET")
-        all_ok = False
+for k,v in KEYS.items():
+    print(f"  {'OK' if v else 'MISSING'} {k}: {v[:10]+'...' if v else 'NOT SET'}")
 
-if not all_ok:
-    print("\n⚠ Fix missing keys in .env before continuing.\n")
-
-
-# ── Test Alpha Vantage ─────────────────────────────────────────
-async def test_alpha_vantage():
+async def test_finnhub():
     import httpx
-    key = os.getenv("ALPHA_VANTAGE_KEY", "")
-    if not key:
-        return "SKIP — key not set"
+    key = os.getenv("FINNHUB_API_KEY","")
+    if not key: return "SKIP"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                "https://www.alphavantage.co/query",
-                params={"function": "SILVER", "interval": "monthly", "apikey": key},
-            )
-            data = r.json()
-            if "Note" in data:
-                return f"RATE LIMITED: {data['Note'][:80]}"
-            if "Information" in data:
-                return f"ERROR: {data['Information'][:80]}"
-            rows = data.get("data", [])
-            if rows:
-                latest = rows[0]
-                return f"OK — Silver latest: {latest['date']} = ${latest['value']}"
-            return f"EMPTY — raw keys: {list(data.keys())}"
-    except Exception as e:
-        return f"EXCEPTION: {e}"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r  = await c.get("https://finnhub.io/api/v1/forex/rates", params={"base":"USD","token":key})
+            inr = r.json().get("quote",{}).get("INR")
+            r2 = await c.get("https://finnhub.io/api/v1/quote", params={"symbol":"OANDA:XAG_USD","token":key})
+            ag  = r2.json().get("c")
+        return f"OK  USD/INR={inr}  Silver=${ag}"
+    except Exception as e: return f"FAIL {e}"
 
-
-# ── Test FRED ──────────────────────────────────────────────────
 async def test_fred():
     import httpx
-    key = os.getenv("FRED_API_KEY", "")
-    if not key:
-        return "SKIP — key not set"
+    key = os.getenv("FRED_API_KEY","")
+    if not key: return "SKIP"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                "https://api.stlouisfed.org/fred/series/observations",
-                params={
-                    "series_id":  "GS10",
-                    "api_key":    key,
-                    "file_type":  "json",
-                    "sort_order": "desc",
-                    "limit":      1,
-                },
-            )
-            obs = r.json().get("observations", [])
-            if obs:
-                return f"OK — US 10Y Yield: {obs[0]['value']}% on {obs[0]['date']}"
-            return f"EMPTY — raw: {r.text[:100]}"
-    except Exception as e:
-        return f"EXCEPTION: {e}"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://api.stlouisfed.org/fred/series/observations",
+                params={"series_id":"GS10","api_key":key,"file_type":"json","sort_order":"desc","limit":1})
+            obs = r.json().get("observations",[])
+            return f"OK  10Y={obs[0]['value']}% ({obs[0]['date']})" if obs else "EMPTY"
+    except Exception as e: return f"FAIL {e}"
 
-
-# ── Test NewsAPI ───────────────────────────────────────────────
 async def test_newsapi():
     import httpx
-    key = os.getenv("NEWS_API_KEY", "")
-    if not key:
-        return "SKIP — key not set"
+    key = os.getenv("NEWS_API_KEY","")
+    if not key: return "SKIP"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                "https://newsapi.org/v2/everything",
-                params={"q": "gold silver commodities", "apiKey": key, "pageSize": 1},
-            )
-            data = r.json()
-            if data.get("status") == "ok":
-                articles = data.get("articles", [])
-                if articles:
-                    return f"OK — '{articles[0]['title'][:60]}...'"
-                return "OK — but 0 articles returned"
-            return f"ERROR: {data.get('message', data)}"
-    except Exception as e:
-        return f"EXCEPTION: {e}"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://newsapi.org/v2/everything",
+                params={"q":"gold silver India","apiKey":key,"pageSize":1})
+            d = r.json()
+            arts = d.get("articles",[])
+            return f"OK  '{arts[0]['title'][:50]}'" if arts else f"status={d.get('status')}"
+    except Exception as e: return f"FAIL {e}"
 
-
-# ── Test Gemini ────────────────────────────────────────────────
 async def test_gemini():
-    key = os.getenv("GEMINI_API_KEY", "")
-    if not key:
-        return "SKIP — key not set"
+    key = os.getenv("GEMINI_API_KEY","")
+    if not key: return "SKIP"
     try:
         from google import genai
-        client = genai.Client(api_key=key)
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents="Say 'OK' and nothing else.",
-        )
-        return f"OK — Response: {response.text.strip()}"
-    except Exception as e:
-        return f"EXCEPTION: {e}"
+        c = genai.Client(api_key=key)
+        r = c.models.generate_content(model="gemini-1.5-flash", contents="Reply OK only.")
+        return f"OK  {r.text.strip()}"
+    except Exception as e: return f"FAIL {str(e)[:100]}"
 
+async def test_groww():
+    key = os.getenv("GROWW_API_KEY","")
+    sec = os.getenv("GROWW_API_SECRET","")
+    if not key or not sec: return "SKIP — set GROWW_API_KEY and GROWW_API_SECRET"
+    try:
+        from growwapi import GrowwAPI
+        token = GrowwAPI.get_access_token(api_key=key, secret=sec)
+        g     = GrowwAPI(token)
+        q     = g.get_ltp(trading_symbol="RELIANCE", exchange="NSE", segment="CASH")
+        return f"OK  RELIANCE LTP=Rs{q.get('ltp')}" if q else "EMPTY"
+    except Exception as e: return f"FAIL {str(e)[:100]}"
 
-# ── Test Supabase ──────────────────────────────────────────────
+async def test_nse():
+    try:
+        from nsepython import nse_get_index_quote
+        d = nse_get_index_quote("NIFTY 50")
+        return f"OK  Nifty50={d.get('last')}" if d else "EMPTY"
+    except Exception as e: return f"FAIL {str(e)[:100]}"
+
 async def test_supabase():
-    url = os.getenv("SUPABASE_URL", "")
-    key = os.getenv("SUPABASE_SERVICE_KEY", "")
-    if not url or not key:
-        return "SKIP — SUPABASE_URL or SUPABASE_SERVICE_KEY not set"
+    url = os.getenv("SUPABASE_URL","")
+    key = os.getenv("SUPABASE_SERVICE_KEY","")
+    if not url or not key: return "SKIP"
     try:
         from supabase import create_client
         sb = create_client(url, key)
-        # Try a simple query — will fail if tables don't exist yet (that's okay)
-        result = sb.table("users").select("id").limit(1).execute()
-        return f"OK — Connected. Users table exists."
+        sb.table("users").select("id").limit(1).execute()
+        return "OK  connected, users table exists"
     except Exception as e:
         err = str(e)
-        if "relation" in err and "does not exist" in err:
-            return "CONNECTED but tables not created yet — run migrations first"
-        return f"EXCEPTION: {err[:120]}"
+        if "does not exist" in err: return "CONNECTED — run: alembic upgrade head"
+        return f"FAIL {err[:100]}"
 
-
-# ── Full commodity fetch ───────────────────────────────────────
-async def test_full_commodity_fetch():
-    """Actually calls your data_fetcher to test end-to-end."""
+async def test_pipeline():
     sys.path.insert(0, os.path.dirname(__file__))
     try:
         from agents.data_fetcher import get_commodity_data
-        print("\n  Fetching SILVER data (this may take 15s due to AV rate limits)...")
-        result = await get_commodity_data("SILVER")
-        if result.get("error"):
-            return f"ERROR: {result['error']}"
-        return (
-            f"OK — Price: ${result['current_price']} | "
-            f"RSI: {result['rsi_14']} | "
-            f"SMA20: {result['sma_20']}"
-        )
-    except Exception as e:
-        return f"EXCEPTION: {e}"
-
+        print("  fetching GOLD via Finnhub...", flush=True)
+        r = await get_commodity_data("GOLD")
+        if r.get("error"): return f"ERROR {r['error']}"
+        return f"OK  price=${r.get('current_price')}  RSI={r.get('rsi_14')}  src={r.get('data_source')}"
+    except Exception as e: return f"FAIL {e}"
 
 async def main():
-    print("\n[2] API CONNECTIVITY TESTS")
+    print("\n[2] API TESTS")
+    for name, fn in [
+        ("Finnhub",   test_finnhub),
+        ("FRED",      test_fred),
+        ("NewsAPI",   test_newsapi),
+        ("Gemini",    test_gemini),
+        ("Groww",     test_groww),
+        ("nsepython", test_nse),
+        ("Supabase",  test_supabase),
+    ]:
+        print(f"  {name:<12}", end=" → ", flush=True)
+        print(await fn())
 
-    print(f"  Alpha Vantage  →", end=" ", flush=True)
-    print(await test_alpha_vantage())
-
-    print(f"  FRED           →", end=" ", flush=True)
-    print(await test_fred())
-
-    print(f"  NewsAPI        →", end=" ", flush=True)
-    print(await test_newsapi())
-
-    print(f"  Gemini         →", end=" ", flush=True)
-    print(await test_gemini())
-
-    print(f"  Supabase       →", end=" ", flush=True)
-    print(await test_supabase())
-
-    print("\n[3] END-TO-END DATA FETCH (data_fetcher.py)")
-    print(f"  get_commodity_data('SILVER') →", end=" ", flush=True)
-    print(await test_full_commodity_fetch())
-
+    print("\n[3] PIPELINE TEST")
+    print("  get_commodity_data('GOLD') →", await test_pipeline())
     print("\n" + "="*55)
-    print("  Done. Fix any ✗ or ERROR above before deploying.")
+    print("  Fix any FAIL/SKIP before deploying.")
     print("="*55 + "\n")
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
