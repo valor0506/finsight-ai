@@ -17,11 +17,10 @@ class Settings(BaseSettings):
     # External APIs
     news_api_key: str = ""
     fred_api_key: str = ""
-    alpha_vantage_key: str = ""
-    twelvedata_api_key: str = ""
     finnhub_api_key: str = ""
     groww_api_key: str = ""
-    
+    groww_api_secret: str = ""
+
     # Database
     database_url: str
     supabase_url: str
