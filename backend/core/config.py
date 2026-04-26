@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     alpha_vantage_key: str = ""
     twelvedata_api_key: str = ""
-
+    finnhub_api_key: str = ""
+    groww_api_key: str = ""
+    
     # Database
     database_url: str
     supabase_url: str
