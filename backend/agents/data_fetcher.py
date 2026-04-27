@@ -34,12 +34,12 @@ FINNHUB_BASE = "https://finnhub.io/api/v1"
 FRED_BASE    = "https://api.stlouisfed.org/fred/series/observations"
 
 FINNHUB_COMMODITIES = {
-    "GOLD":        "OANDA:XAU_USD",
-    "SILVER":      "OANDA:XAG_USD",
-    "CRUDE_WTI":   "OANDA:WTICO_USD",
-    "CRUDE_BRENT": "OANDA:BCO_USD",
-    "NATURAL_GAS": "OANDA:NATGAS_USD",
-    "COPPER":      "OANDA:COPPER_USD",
+    "GOLD":        "FOREXCOM:XAUUSD",
+    "SILVER":      "FOREXCOM:XAGUSD",
+    "CRUDE_WTI":   "FOREXCOM:USOIL",
+    "CRUDE_BRENT": "FOREXCOM:UKOIL",
+    "NATURAL_GAS": "FOREXCOM:NATGASUSD",
+    "COPPER":      "FOREXCOM:COPPER",
 }
 
 FRED_SERIES = {
@@ -162,13 +162,21 @@ async def _fh_candles(symbol: str, days: int = 365) -> list:
 
 
 async def _fh_forex(from_cur: str, to_cur: str) -> Optional[float]:
+    """
+    Get forex rate via Finnhub free tier.
+    Uses /forex/rates which returns all pairs against base currency.
+    """
     if not settings.finnhub_api_key:
         return None
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(f"{FINNHUB_BASE}/forex/rates",
-                            params={"base": from_cur, "token": settings.finnhub_api_key})
-            return r.json().get("quote", {}).get(to_cur)
+            r = await c.get(
+                f"{FINNHUB_BASE}/forex/rates",
+                params={"base": from_cur, "token": settings.finnhub_api_key},
+            )
+            data = r.json()
+            rate = data.get("quote", {}).get(to_cur)
+            return float(rate) if rate else None
     except Exception:
         return None
 
@@ -176,15 +184,27 @@ async def _fh_forex(from_cur: str, to_cur: str) -> Optional[float]:
 # ── Tier 1: Groww ──────────────────────────────────────────────
 
 def _groww_client():
-    if not settings.groww_api_key or not settings.groww_api_secret:
+    """
+    Initialize Groww API client.
+    GROWW_API_KEY from Groww Trade API dashboard is already an access token (JWT).
+    GROWW_API_SECRET is used only if token refresh is needed.
+    """
+    if not settings.groww_api_key:
         return None
     try:
         from growwapi import GrowwAPI
-        token = GrowwAPI.get_access_token(
-            api_key=settings.groww_api_key,
-            secret=settings.groww_api_secret,
-        )
-        return GrowwAPI(token)
+        # If key looks like a JWT (starts with eyJ), use directly as access token
+        key = settings.groww_api_key
+        if key.startswith("eyJ"):
+            return GrowwAPI(access_token=key)
+        # Otherwise try getting token via key+secret
+        if settings.groww_api_secret:
+            token = GrowwAPI.get_access_token(
+                api_key=key,
+                secret=settings.groww_api_secret,
+            )
+            return GrowwAPI(access_token=token)
+        return None
     except Exception:
         return None
 
