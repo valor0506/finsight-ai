@@ -33,12 +33,35 @@ async def test_finnhub():
     if not key: return "SKIP"
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r  = await c.get("https://finnhub.io/api/v1/forex/rates", params={"base":"USD","token":key})
-            inr = r.json().get("quote",{}).get("INR")
-            r2 = await c.get("https://finnhub.io/api/v1/quote", params={"symbol":"OANDA:XAG_USD","token":key})
-            ag  = r2.json().get("c")
-        return f"OK  USD/INR={inr}  Silver=${ag}"
-    except Exception as e: return f"FAIL {e}"
+            # Forex rates
+            r1 = await c.get("https://finnhub.io/api/v1/forex/rates",
+                             params={"base": "USD", "token": key})
+            quote = r1.json().get("quote", {})
+            inr   = quote.get("INR")
+            # Show first 5 available keys if INR missing
+            available = list(quote.keys())[:5] if not inr else []
+
+            # Commodity quote
+            r2 = await c.get("https://finnhub.io/api/v1/quote",
+                             params={"symbol": "FOREXCOM:XAUUSD", "token": key})
+            gold = r2.json().get("c")
+
+            # Candles test
+            import time
+            r3 = await c.get("https://finnhub.io/api/v1/stock/candle", params={
+                "symbol": "FOREXCOM:XAUUSD", "resolution": "D",
+                "from": int(time.time()) - 86400*7,
+                "to":   int(time.time()),
+                "token": key,
+            })
+            candle_status = r3.json().get("s")
+
+        msg = f"USD/INR={inr}  Gold=${gold}  candles={candle_status}"
+        if available:
+            msg += f"  (INR missing, sample keys: {available})"
+        return f"OK  {msg}"
+    except Exception as e:
+        return f"FAIL {e}"
 
 async def test_fred():
     import httpx
