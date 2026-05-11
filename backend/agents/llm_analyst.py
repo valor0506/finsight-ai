@@ -1,7 +1,7 @@
 """
 agents/llm_analyst.py
 
-Tier 3 — Gemini 1.5 Flash analysis layer.
+Tier 3 — OpenRouter (Llama 3.3 70B) analysis layer.
 
 STRICT RULES:
     1. Only uses data passed in from Tier 1/2 (data_fetcher.py)
@@ -9,11 +9,14 @@ STRICT RULES:
     3. Never estimates, infers, or fills missing numbers
     4. Never contradicts the raw data provided
 """
-from google import genai
+from openai import OpenAI
 from core.config import get_settings
 
 settings = get_settings()
-client   = genai.Client(api_key=settings.gemini_api_key)
+client   = OpenAI(
+    api_key=settings.openrouter_api_key,
+    base_url="https://openrouter.ai/api/v1",
+)
 
 STRICT_PREFIX = """
 STRICT DATA RULES (follow without exception):
@@ -100,11 +103,13 @@ Tone: Professional, direct, no fluff. Written for an Indian retail investor who 
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
+        response = client.chat.completions.create(
+            model="meta-llama/llama-3.3-70b-instruct:free",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=4096,
         )
-        return {"text": response.text, "symbol": symbol}
+        return {"text": response.choices[0].message.content, "symbol": symbol}
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
 
@@ -185,10 +190,12 @@ Tone: Professional, specific, no fluff. For Indian retail investors.
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
+        response = client.chat.completions.create(
+            model="meta-llama/llama-3.3-70b-instruct:free",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=4096,
         )
-        return {"text": response.text, "symbol": symbol}
+        return {"text": response.choices[0].message.content, "symbol": symbol}
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
