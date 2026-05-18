@@ -16,7 +16,7 @@ Data Hierarchy:
         FRED         → TTL 24 hours
         News         → TTL 30 minutes
 
-    Tier 3 — Gemini (llm_analyst.py)
+    Tier 3 — OpenRouter LLM (llm_analyst.py)
         ONLY receives structured data from Tier 1/2.
         If any field is None → LLM says "Data unavailable".
         LLM never fills, estimates, or hallucinates numbers.
@@ -163,20 +163,21 @@ async def _fh_candles(symbol: str, days: int = 365) -> list:
 
 async def _fh_forex(from_cur: str, to_cur: str) -> Optional[float]:
     """
-    Get forex rate via Finnhub free tier.
-    Uses /forex/rates which returns all pairs against base currency.
+    Get forex rate via Finnhub /quote endpoint.
+    Uses OANDA symbol format: OANDA:USD_INR
     """
     if not settings.finnhub_api_key:
         return None
     try:
+        symbol = f"OANDA:{from_cur}_{to_cur}"
         async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.get(
-                f"{FINNHUB_BASE}/forex/rates",
-                params={"base": from_cur, "token": settings.finnhub_api_key},
+                f"{FINNHUB_BASE}/quote",
+                params={"symbol": symbol, "token": settings.finnhub_api_key},
             )
             data = r.json()
-            rate = data.get("quote", {}).get(to_cur)
-            return float(rate) if rate else None
+            price = data.get("c")
+            return float(price) if price and price != 0 else None
     except Exception:
         return None
 
@@ -185,31 +186,34 @@ async def _fh_forex(from_cur: str, to_cur: str) -> Optional[float]:
 
 def _groww_client():
     """
-    Initialize Groww API client.
-    GROWW_API_KEY from Groww Trade API dashboard is already an access token (JWT).
-    GROWW_API_SECRET is used only if token refresh is needed.
+    Correct TOTP-based auth as per Groww official SDK docs.
+    Requires:
+        GROWW_API_KEY      → TOTP token from Groww API Keys page
+        GROWW_TOTP_SECRET  → Secret shown when generating the key (for pyotp)
+    Docs: https://groww.in/trade-api/docs/python-sdk
     """
-    if not settings.groww_api_key:
+    if not settings.groww_api_key or not settings.groww_totp_secret:
         return None
     try:
+        import pyotp
         from growwapi import GrowwAPI
-        # If key looks like a JWT (starts with eyJ), use directly as access token
-        key = settings.groww_api_key
-        if key.startswith("eyJ"):
-            return GrowwAPI(access_token=key)
-        # Otherwise try getting token via key+secret
-        if settings.groww_api_secret:
-            token = GrowwAPI.get_access_token(
-                api_key=key,
-                secret=settings.groww_api_secret,
-            )
-            return GrowwAPI(access_token=token)
-        return None
-    except Exception:
+        totp         = pyotp.TOTP(settings.groww_totp_secret).now()
+        access_token = GrowwAPI.get_access_token(
+            api_key=settings.groww_api_key,
+            totp=totp,
+        )
+        return GrowwAPI(access_token)
+    except Exception as e:
+        print(f"[Groww] Auth failed: {e}")
         return None
 
 
 async def _groww_quote(symbol: str, exchange: str = "NSE") -> dict:
+    """
+    Fetch live quote using groww.get_quote().
+    Response fields: last_price, ohlc{open/high/low/close},
+                     week_52_high, week_52_low, day_change_perc, volume
+    """
     try:
         g = _groww_client()
         if not g:
@@ -217,35 +221,51 @@ async def _groww_quote(symbol: str, exchange: str = "NSE") -> dict:
         loop = asyncio.get_event_loop()
         q = await loop.run_in_executor(
             None,
-            lambda: g.get_ltp(trading_symbol=symbol, exchange=exchange, segment="CASH")
+            lambda: g.get_quote(
+                exchange=exchange,
+                segment="CASH",
+                trading_symbol=symbol,
+            )
         )
         if not q:
             return {}
+        ohlc = q.get("ohlc", {})
         return {
-            "price":      q.get("ltp"),
-            "high":       q.get("high"),
-            "low":        q.get("low"),
-            "volume":     q.get("volume"),
-            "change_pct": q.get("change_percent"),
+            "price":        q.get("last_price"),
+            "high":         ohlc.get("high"),
+            "low":          ohlc.get("low"),
+            "volume":       q.get("volume"),
+            "change_pct":   q.get("day_change_perc"),
+            "week_52_high": q.get("week_52_high"),
+            "week_52_low":  q.get("week_52_low"),
         }
-    except Exception:
+    except Exception as e:
+        print(f"[Groww] Quote failed: {e}")
         return {}
 
 
 async def _groww_ohlc(symbol: str, exchange: str = "NSE", days: int = 365) -> list:
+    """
+    Fetch historical daily candles using get_historical_candle_data().
+    interval_in_minutes=1440 → daily candles.
+    Candle format: [epoch_seconds, open, high, low, close, volume]
+    """
     try:
         g = _groww_client()
         if not g:
             return []
-        to_d   = datetime.utcnow().strftime("%Y-%m-%d")
-        from_d = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-        loop   = asyncio.get_event_loop()
-        data   = await loop.run_in_executor(
+        end_time   = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        start_time = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
             None,
-            lambda: g.get_historical_data(
-                trading_symbol=symbol, exchange=exchange,
-                segment="CASH", from_date=from_d,
-                to_date=to_d, interval="1d",
+            lambda: g.get_historical_candle_data(
+                trading_symbol=symbol,
+                exchange=exchange,
+                segment="CASH",
+                start_time=start_time,
+                end_time=end_time,
+                interval_in_minutes=1440,
             )
         )
         if not data:
@@ -253,14 +273,15 @@ async def _groww_ohlc(symbol: str, exchange: str = "NSE", days: int = 365) -> li
         candles = data.get("candles", [])
         return [
             {
-                "date":   c[0][:10] if isinstance(c[0], str) else str(c[0]),
+                "date":   datetime.utcfromtimestamp(c[0]).strftime("%Y-%m-%d"),
                 "open":   c[1], "high": c[2],
                 "low":    c[3], "close": c[4],
                 "volume": c[5] if len(c) > 5 else None,
             }
             for c in candles if len(c) >= 5
         ]
-    except Exception:
+    except Exception as e:
+        print(f"[Groww] OHLC failed: {e}")
         return []
 
 
