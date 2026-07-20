@@ -12,14 +12,14 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 10080  # 7 days
 
     # AI
-    gemini_api_key: str
-
+    # gemini_api_key: str
+    OPENROUTER_API_KEY: str 
     # External APIs
     news_api_key: str = ""
     fred_api_key: str = ""
     finnhub_api_key: str = ""
     groww_api_key: str = ""
-    groww_api_secret: str = ""
+    groww_totp_secret: str = ""
 
     # Database
     database_url: str
