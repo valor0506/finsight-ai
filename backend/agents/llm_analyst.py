@@ -102,14 +102,101 @@ State confidence level: High / Medium / Low based on data availability.
 Tone: Professional, direct, no fluff. Written for an Indian retail investor who understands basic finance.
 """
 
+def _generate_llm_analysis(prompt: str) -> str:
+    models = [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct",
+        "deepseek/deepseek-r1-distill-llama-70b:free",
+        "google/gemini-2.0-flash-lite-001",
+    ]
+    last_error = None
+    for model in models:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            if response.choices and response.choices[0].message.content:
+                return response.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(f"All LLM models failed. Last error: {last_error}")
+
+
+async def analyse_commodity(symbol: str, data: dict, macro: dict, analysis_type: str = "full") -> dict:
+    """
+    Generate commodity intelligence report.
+    data  → output of get_commodity_data()
+    macro → output of get_macro_snapshot()
+    """
+    news_block = ""
+    if data.get("news"):
+        headlines = "\n".join(f"- {n['title']} ({n['source']})" for n in data["news"][:5] if n.get("title"))
+        news_block = f"\nRecent News Headlines:\n{headlines}"
+
+    prompt = f"""
+{STRICT_PREFIX}
+
+You are a senior commodity analyst writing a professional investment-grade report for Indian retail investors.
+Asset: {symbol}
+
+=== MARKET DATA (from Finnhub) ===
+Current Price : {_fmt(data.get('current_price'), ' USD')}
+52-Week High  : {_fmt(data.get('week_52_high'), ' USD')}
+52-Week Low   : {_fmt(data.get('week_52_low'), ' USD')}
+% from 52W High: {_fmt(data.get('pct_from_52w_high'), '%')}
+RSI-14        : {_fmt(data.get('rsi_14'))}
+SMA-20        : {_fmt(data.get('sma_20'), ' USD')}
+SMA-50        : {_fmt(data.get('sma_50'), ' USD')}
+Data Source   : {data.get('data_source', 'Finnhub')}
+Fetched At    : {data.get('fetched_at')}
+
+=== MACRO CONTEXT (from FRED + Finnhub + nsepython) ===
+DXY (USD Index)    : {_fmt(macro.get('DXY', {}).get('value'))}
+US 10Y Yield       : {_fmt(macro.get('US_10Y_YIELD', {}).get('value'), '%')}
+Fed Funds Rate     : {_fmt(macro.get('FED_FUNDS_RATE', {}).get('value'), '%')}
+CPI (US)           : {_fmt(macro.get('CPI_YOY', {}).get('value'))}
+VIX                : {_fmt(macro.get('VIX_US', {}).get('value'))}
+USD/INR            : {_fmt(macro.get('USDINR', {}).get('value'))}
+Gold Price         : {_fmt(macro.get('GOLD_PRICE', {}).get('value'), ' USD')}
+Silver Price       : {_fmt(macro.get('SILVER_PRICE', {}).get('value'), ' USD')}
+Gold-Silver Ratio  : {_fmt(macro.get('GOLD_SILVER_RATIO', {}).get('value'))}
+Nifty 50           : {_fmt(macro.get('NIFTY50', {}).get('value'))}
+USD/INR Impact     : A rising DXY typically pressures commodity prices in USD terms.
+                     For Indian investors, a weaker INR means higher import cost even if USD price falls.
+{news_block}
+
+=== REPORT STRUCTURE ===
+Write exactly these 5 sections with these exact headings:
+
+## 1. Executive Summary
+2-3 sentences. Current price, trend direction, key signal.
+
+## 2. Technical Analysis
+RSI interpretation, price vs SMA-20/SMA-50, 52W range position, momentum.
+
+## 3. Macro Context & India Impact
+How DXY, US yields, Fed rate affect {symbol}.
+How USD/INR affects Indian investors specifically (INR import cost angle).
+FII/DII flows if relevant.
+
+## 4. Key Risks
+3-4 specific risks with data backing. If data is unavailable for a risk factor, say so.
+
+## 5. Outlook & Price Targets
+Near-term (1 month) and medium-term (3 month) view.
+Support and resistance levels from the 52W range.
+State confidence level: High / Medium / Low based on data availability.
+
+Tone: Professional, direct, no fluff. Written for an Indian retail investor who understands basic finance.
+"""
+
     try:
-        response = client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=4096,
-        )
-        return {"text": response.choices[0].message.content, "symbol": symbol}
+        text = _generate_llm_analysis(prompt)
+        return {"text": text, "symbol": symbol}
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
 
@@ -190,12 +277,7 @@ Tone: Professional, specific, no fluff. For Indian retail investors.
 """
 
     try:
-        response = client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=4096,
-        )
-        return {"text": response.choices[0].message.content, "symbol": symbol}
+        text = _generate_llm_analysis(prompt)
+        return {"text": text, "symbol": symbol}
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
