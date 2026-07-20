@@ -125,9 +125,10 @@ def _build_cover(doc, symbol: str, report_type: str = "Commodity"):
     shd2.set(qn("w:val"), "clear"); shd2.set(qn("w:color"), "auto"); shd2.set(qn("w:fill"), DARK_BG)
     pPr2.append(shd2)
     ts = datetime.utcnow().strftime("%d %b %Y, %H:%M UTC")
-    _add_run(sub_p,
-             f"Generated: {ts}  |  Powered by Gemini 1.5 Flash  |  Data: Alpha Vantage + FRED + NewsAPI",
-             size_pt=9, color=MID_GREY)
+    _add_run(
+        sub_p,
+        f"Generated: {ts}  |  Powered by FinSight AI Engine (Llama 3.3 70B)  |  Data: Finnhub + Groww + FRED + NewsAPI",
+        size_pt=9, color=MID_GREY)
     doc.add_paragraph()
 
 
