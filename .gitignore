@@ -20,3 +20,6 @@ dist/
 # Generated files
 *.docx
 *.pdf
+*.db
+*.sqlite
+*.sqlite3

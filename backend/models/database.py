@@ -7,18 +7,41 @@ from sqlalchemy import String, Text, DateTime, Boolean, ForeignKey, JSON, func
 from core.config import get_settings
 import uuid
 
+settings = get_settings()
 db_url = settings.database_url
 if db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 elif db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-engine = create_async_engine(
-    db_url,
-    echo=settings.environment == "development",
-    pool_size=10,
-    max_overflow=20,
-)
+# Clean query params unsupported by asyncpg like pgbouncer=true
+if "?pgbouncer=true" in db_url:
+    db_url = db_url.replace("?pgbouncer=true", "")
+elif "&pgbouncer=true" in db_url:
+    db_url = db_url.replace("&pgbouncer=true", "")
+
+connect_args = {}
+engine_kwargs = {
+    "echo": settings.environment == "development",
+}
+
+if db_url.startswith("sqlite"):
+    if not db_url.startswith("sqlite+aiosqlite"):
+        db_url = db_url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+else:
+    if "6543" in db_url or "pooler" in db_url:
+        connect_args["statement_cache_size"] = 0
+    engine_kwargs["pool_size"] = 10
+    engine_kwargs["max_overflow"] = 20
+
+if connect_args:
+    engine_kwargs["connect_args"] = connect_args
+
+engine = create_async_engine(db_url, **engine_kwargs)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

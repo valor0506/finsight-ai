@@ -13,7 +13,8 @@ class Settings(BaseSettings):
 
     # AI
     # gemini_api_key: str
-    OPENROUTER_API_KEY: str 
+    openrouter_api_key: str = ""
+    OPENROUTER_API_KEY: str = ""
     # External APIs
     news_api_key: str = ""
     fred_api_key: str = ""
