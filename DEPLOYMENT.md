@@ -1,5 +1,5 @@
 # FinSight AI — Production Deployment Guide
-> Step-by-step instructions to deploy backend (Railway), task queue (Upstash Redis), database/storage (Supabase), and frontend (Vercel).
+> Step-by-step instructions to deploy backend & Celery worker (Render Free Tier), task queue (Upstash Redis), database/storage (Supabase), and frontend (Vercel).
 
 ---
 
@@ -8,124 +8,166 @@
 ```
 ┌────────────────────────────────────────────────────────┐
 │               Vercel Frontend (React/Vite)              │
+│               https://finsight.vercel.app              │
 └──────────────────────────┬─────────────────────────────┘
                            │ API Requests
                            ▼
 ┌────────────────────────────────────────────────────────┐
-│           Railway Backend Web Service (FastAPI)        │
+│          Render Web Service (FastAPI + Celery)         │
+│          Runs start.sh: uvicorn (port 10000)           │
+│          + celery worker (concurrency 1)               │
 └──────────────┬───────────────────────────┬─────────────┘
                │ Dispatch Celery Tasks     │ DB Read/Write
                ▼                           ▼
 ┌─────────────────────────────┐ ┌────────────────────────┐
 │ Upstash Redis (Task Broker) │ │ Supabase (Postgres DB) │
-└──────────────┬──────────────┘ └───────────▲────────────┘
-               │ Pull Tasks                 │ Update Status &
-               ▼                            │ Upload .docx
-┌───────────────────────────────────────────┴────────────┐
-│         Railway Celery Worker Service (Worker)         │
-└────────────────────────────────────────────────────────┘
+└─────────────────────────────┘ └───────────▲────────────┘
+                                            │ Update Status &
+                                            │ Upload .docx
 ```
 
 ---
 
 ## Step 1: Database & Storage Setup (Supabase)
 
-1. **Get Connection Credentials**:
-   - Navigate to **Supabase Dashboard** → **Project Settings** → **Database**.
-   - Copy your PostgreSQL connection string: `postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres`.
-   - Go to **Project Settings** → **API**. Copy the `URL`, `anon public key`, and `service_role secret key`.
+1. **Create Supabase Project**:
+   - Go to [Supabase](https://supabase.com/) and create a free project.
+   - Region: Select nearest region (e.g., `South Asia (Mumbai)` or `US East`).
 
-2. **Run Alembic Migrations**:
-   In your local backend terminal with `.env` configured to point to your Supabase `DATABASE_URL`:
-   ```bash
-   cd backend
-   alembic upgrade head
-   ```
-   *This creates `users`, `reports`, `watchlists`, and `cached_data` tables.*
+2. **Get Connection Credentials**:
+   - Navigate to **Project Settings** → **Database**.
+   - Under **Connection String** → **URI**, copy:
+     ```
+     postgresql://postgres:[YOUR-PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres
+     ```
+   - Go to **Project Settings** → **API**. Copy:
+     - `Project URL` (e.g., `https://xxxx.supabase.co`)
+     - `anon` `public` key
+     - `service_role` `secret` key
 
-3. **Create Storage Bucket**:
-   - Go to **Supabase Dashboard** → **Storage**.
-   - Click **New Bucket**. Name it `reports`.
-   - Toggle **Public bucket** to ON.
+3. **Create Storage Bucket for Reports**:
+   - Go to **Storage** → **New Bucket**.
+   - Bucket name: `reports`
+   - Toggle **Public bucket** to **ON**.
    - Click **Save**.
 
+4. **Initialize Tables**:
+   - On the first backend startup on Render, FinSight's FastAPI app automatically executes table creation (`users`, `reports`, `watchlists`, `cached_data`).
+   - *(Optional local migration)*: You can also run locally:
+     ```bash
+     cd backend
+     alembic upgrade head
+     ```
+
 ---
 
-## Step 2: Task Queue Setup (Upstash Redis)
+## Step 2: Redis Task Broker Setup (Upstash Redis)
 
-1. **Create Redis Database**:
+1. **Create Free Redis Instance**:
    - Go to [Upstash Console](https://console.upstash.com/) → **Redis** → **Create Database**.
-   - Select region closest to your Railway deployment (e.g. `ap-south-1` or `us-east-1`).
-   - Enable **TLS/SSL**.
+   - Database Name: `finsight-redis`
+   - Region: Closest to your database/backend.
+   - **TLS (SSL)**: Enabled by default.
 
 2. **Copy Connection String**:
-   - Copy the `rediss://...` string under **Celery / Redis Client**. Example:
-     `rediss://default:PASSWORD@xxxx.upstash.io:6379`
+   - In the database details, scroll to **Connect to your database**.
+   - Select the **Celery** or **redis-py** tab.
+   - Copy the connection URL starting with `rediss://`:
+     ```
+     rediss://default:[PASSWORD]@[ENDPOINT].upstash.io:6379
+     ```
 
 ---
 
-## Step 3: Backend Deployment (Railway)
+## Step 3: Backend Deployment (Render Free Tier)
 
-1. **Create Railway Project**:
-   - Go to [Railway Dashboard](https://railway.app/) → **New Project** → **Deploy from GitHub repo**.
-   - Connect your `valor0506/finsight-ai` repository.
+You can deploy on Render in either of two ways:
 
-2. **Configure Web Service**:
-   - In Railway Service Settings:
-     - **Build Command**: `pip install -r backend/requirements.txt`
-     - **Start Command**: `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
-     - Or specify **Root Directory**: `backend` (if root directory is set to `backend`, Start Command is `uvicorn main:app --host 0.0.0.0 --port $PORT`).
+### Option A: Render Blueprint (Easiest — 1-Click via `render.yaml`)
+1. Push your latest code to your GitHub repo (`origin/main`).
+2. Go to [Render Dashboard](https://dashboard.render.com/) → **New +** → **Blueprint**.
+3. Connect your `valor0506/finsight-ai` repository.
+4. Render will detect `render.yaml`.
+5. Enter the required environment variables when prompted and click **Apply**.
 
-3. **Configure Celery Worker Service**:
-   - In Railway, click **+ New Service** → **GitHub Repo** (same repo).
-   - Set **Root Directory**: `backend`.
-   - Set **Start Command**: `celery -A tasks.celery_app.celery_app worker --loglevel=info --concurrency=2`
+---
 
-4. **Environment Variables (Add to both Web & Worker services)**:
-   ```env
-   ENVIRONMENT=production
-   FRONTEND_URL=https://your-app.vercel.app
-   SECRET_KEY=your_secure_random_jwt_secret_key
-   OPENROUTER_API_KEY=sk-or-v1-...
-   FINNHUB_API_KEY=...
-   GROWW_API_KEY=...
-   GROWW_TOTP_SECRET=...
-   FRED_API_KEY=...
-   NEWS_API_KEY=...
-   DATABASE_URL=postgresql://postgres:pass@db.xxxx.supabase.co:5432/postgres
-   SUPABASE_URL=https://xxxx.supabase.co
-   SUPABASE_ANON_KEY=...
-   SUPABASE_SERVICE_KEY=...
-   REDIS_URL=rediss://default:pass@xxxx.upstash.io:6379
-   ```
+### Option B: Manual Web Service Setup (Step-by-Step)
+1. Go to [Render Dashboard](https://dashboard.render.com/) → **New +** → **Web Service**.
+2. Select **Build and deploy from a Git repository** and connect `valor0506/finsight-ai`.
+3. Fill in the service configuration:
+   - **Name**: `finsight-backend`
+   - **Region**: Oregon (or nearest)
+   - **Branch**: `main`
+   - **Root Directory**: `backend`
+   - **Runtime**: `Python 3`
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `bash start.sh`
+   - **Instance Type**: `Free`
 
-5. **Generate Railway Domain**:
-   - In Web Service Settings → **Networking** → **Generate Domain**.
-   - Copy the public URL (e.g., `https://finsight-backend-production.up.railway.app`).
+4. Scroll down to **Environment Variables** and add:
+
+   | Key | Value | Description |
+   |---|---|---|
+   | `ENVIRONMENT` | `production` | Production mode |
+   | `PYTHON_VERSION` | `3.11.9` | Stable Python runtime |
+   | `SECRET_KEY` | *(generate a random string or click generate)* | JWT signing key |
+   | `DATABASE_URL` | `postgresql://postgres:...` | Supabase Postgres URL |
+   | `SUPABASE_URL` | `https://xxxx.supabase.co` | Supabase API URL |
+   | `SUPABASE_ANON_KEY` | `eyJhbGci...` | Supabase anon key |
+   | `SUPABASE_SERVICE_KEY` | `eyJhbGci...` | Supabase service_role key |
+   | `REDIS_URL` | `rediss://default:...@...upstash.io:6379` | Upstash Redis TLS URL |
+   | `OPENROUTER_API_KEY` | `sk-or-v1-...` | OpenRouter LLM API key |
+   | `FINNHUB_API_KEY` | *(your finnhub key)* | US market data |
+   | `FRED_API_KEY` | *(your fred key)* | Macro interest rate/inflation |
+   | `NEWS_API_KEY` | *(your news api key)* | Global market news |
+   | `GROWW_API_KEY` | *(optional/your key)* | Indian stock data |
+   | `GROWW_TOTP_SECRET` | *(optional/your key)* | Indian stock TOTP |
+   | `FRONTEND_URL` | `https://your-app.vercel.app` | Vercel domain (can update after Step 4) |
+
+5. Under **Advanced Settings**:
+   - **Health Check Path**: `/health`
+   - **Auto-Deploy**: `Yes`
+
+6. Click **Create Web Service**.
+7. Wait 2-3 minutes for the build to finish. Once live, copy your backend URL:
+   `https://finsight-backend-xxxx.onrender.com`
 
 ---
 
 ## Step 4: Frontend Deployment (Vercel)
 
-1. **Import Project to Vercel**:
-   - Go to [Vercel Dashboard](https://vercel.com/) → **Add New Project**.
-   - Import `valor0506/finsight-ai`.
-   - Set **Framework Preset**: `Vite`.
-   - Set **Root Directory**: `frontend`.
-
-2. **Set Environment Variable**:
-   - Key: `VITE_API_URL`
-   - Value: `https://finsight-backend-production.up.railway.app` (your Railway Web Service URL).
-
-3. **Deploy**:
-   - Click **Deploy**.
-   - Vercel will build Vite assets and host your frontend. The included `frontend/vercel.json` ensures SPA routes like `/dashboard`, `/generate`, and `/reports/:id` work smoothly on refresh.
+1. Go to [Vercel Dashboard](https://vercel.com/) → **Add New** → **Project**.
+2. Import `valor0506/finsight-ai`.
+3. Configure project:
+   - **Framework Preset**: `Vite`
+   - **Root Directory**: Click edit and select `frontend`
+   - **Build Command**: `npm run build`
+   - **Output Directory**: `dist`
+4. Expand **Environment Variables**:
+   - Name: `VITE_API_URL`
+   - Value: `https://finsight-backend-xxxx.onrender.com` *(your Render backend URL, NO trailing slash)*
+5. Click **Deploy**.
+6. Once deployed, copy your frontend production URL (e.g. `https://finsight-ai.vercel.app`).
+7. **Back in Render**: Update the `FRONTEND_URL` environment variable to match your Vercel URL.
 
 ---
 
-## Post-Deployment Checklist
+## Post-Deployment Verification
 
-- [ ] Test `/health` endpoint on Railway backend (`https://your-railway-url.up.railway.app/health`).
-- [ ] Test frontend signup & login.
-- [ ] Submit a test report request on the frontend (`/generate`) and verify Celery processes the background task.
-- [ ] Check Supabase `reports` bucket to ensure `.docx` is uploaded and downloadable.
+1. **Verify Backend Health**:
+   Visit: `https://finsight-backend-xxxx.onrender.com/health`
+   Expected response:
+   ```json
+   {"status":"healthy","timestamp":"2026-10-07T..."}
+   ```
+2. **Verify Frontend UI**:
+   Open your Vercel URL, navigate through pages.
+3. **Register / Login**:
+   Create a test account on the registration page.
+4. **Generate Report**:
+   Submit an equity (`RELIANCE.NS` or `AAPL`) or commodity (`GOLD`) report.
+   - Celery worker receives the job via Upstash Redis.
+   - OpenRouter generates the multi-section financial analysis.
+   - Supabase storage saves the formatted `.docx`.
+   - Download the generated file from the dashboard.
